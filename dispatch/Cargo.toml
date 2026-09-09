@@ -1,0 +1,15 @@
+[package]
+name = "pf-dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Session correlation and worker pool dispatch engine for icsyd-pf."
+
+[dependencies]
+pf-core = { workspace = true }
+pf-methods = { workspace = true }
+
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
