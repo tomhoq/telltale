@@ -43,7 +43,7 @@ pub enum Transport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Direction {
-    /// Initiator -> responder. Scanner traffic is almost always this side.
+    /// Initiator -> responder. Honeypot logs often only see this direction, so it's the default.
     ToResponder,
     ToInitiator,
 }
