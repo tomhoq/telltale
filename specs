@@ -1,0 +1,227 @@
+# Build Spec: Extensible Passive Network Fingerprinting Framework
+
+## Context for the agent
+
+This is an MSc thesis project ("An Extensible Passive Fingerprinting Framework for
+Honeypots"). The tool passively fingerprints network clients (attackers hitting a
+honeypot) using multiple independent methods (p0f-style TCP/IP analysis, JA3/JA4
+TLS fingerprinting, JA4H HTTP fingerprinting, HASSH/JA4SSH SSH fingerprinting,
+plus a novel fusion method combining layers). The core design goal is
+**extensibility**: adding a new fingerprinting method should require minimal to
+no changes to the framework itself.
+
+Build in **Rust**. Target a single Cargo workspace, split into crates as
+described below. Work in the phase order given — each phase should leave the
+tool in a runnable state, not a half-built one.
+
+---
+
+## Core architectural decisions (do not deviate without flagging it)
+
+1. **Adapter pattern for methods.** Every fingerprinting method, regardless of
+   how it's implemented internally, is exposed through one common trait:
+
+   ```rust
+   trait FingerprintMethod {
+       fn name(&self) -> &str;
+       fn triggers(&self) -> &[TriggerEvent]; // e.g. TcpSyn, TlsClientHello, HttpRequest
+       fn extract(&self, packet: &Packet, session: &Session) -> Vec<ResultEntry>;
+   }
+   ```
+
+   - `session` is a **read-only** accumulator of everything seen so far in that
+     flow. Single-packet methods (p0f, JA4) ignore it. Sequence-dependent
+     methods (JA4SSH, L3 timing) read `session.packets_so_far` /
+     `session.results`.
+   - Internally, an implementation of this trait may either (a) run in-process
+     Rust logic, or (b) shell out to an external binary via
+     `tokio::process::Command` with an enforced timeout. Both look identical
+     from the framework's point of view. Timeouts are mandatory for (b) — one
+     hung subprocess must never block the pipeline.
+
+2. **YAML manifest per method.** Each method ships a YAML file declaring:
+   - `name`, `layer` (L1/L2/L3)
+   - `triggers`: which protocol event(s) fire this method
+   - `invocation`: in-process module path OR external command + args
+   - `output_schema`: list of `{field, type, kind}` where `kind` is one of a
+     small fixed vocabulary: `classification`, `flag`, `score`,
+     `raw_signature`. New methods must fit an existing `kind`; only extend the
+     `kind` vocabulary itself as a last resort.
+
+   The manifest is metadata/config only — never put parsing logic in YAML.
+
+3. **Single shared capture layer.** One capture component feeds all methods.
+   Do not let methods each open their own capture handle. Capture sources
+   (pcap file, live interface, honeypot log ingestion) must be interchangeable
+   behind one trait, e.g. `trait PacketSource { fn next_packet(&mut self) ->
+   Option<Packet>; }`.
+
+4. **Session/flow correlation.** A separate component sits between capture and
+   dispatch: groups packets into `Session` objects keyed by 5-tuple, with a
+   configurable inactivity timeout. On timeout, mark the session
+   finalized/evaluated even if incomplete (partial results are acceptable and
+   expected — do not block waiting for a "complete" session).
+
+5. **Per-packet trigger/dispatch engine.** For every incoming packet:
+   parse → classify protocol event (`TcpSyn`, `TlsClientHello`, `HttpRequest`,
+   etc.) → look up which registered methods declared that trigger in their
+   YAML → dispatch each matching method's `extract()` call into a worker pool
+   (tokio tasks, or a thread pool if a method turns out CPU-bound). Methods
+   must not block each other.
+
+6. **Results storage: append-only, never overwritten.** Each session holds a
+   flat, immutable, append-only list of result entries:
+
+   ```rust
+   struct ResultEntry {
+       method: String,
+       trigger: TriggerEvent,
+       timestamp: Instant,
+       fields: HashMap<String, FieldValue>, // shape defined by that method's output_schema
+   }
+   ```
+
+   Do not attempt to merge/deduplicate/reconcile conflicting results from
+   different methods at storage time. Merging is a *separate, later,
+   optional* consumer of this list (see Fusion below), not something baked
+   into the storage layer.
+
+7. **Fusion is just another method.** The fusion method is registered like any
+   other `FingerprintMethod`, except its trigger is something like
+   `AfterNResults(3)` or `SessionTimeout`, and its `extract()` reads
+   `session.results` (the other methods' outputs so far) instead of raw packet
+   bytes. It appends its own `ResultEntry` (method = "fusion") to the same
+   list. This keeps merging logic swappable/extensible without touching core
+   storage.
+
+8. **Two consumption modes over the same result stream:**
+   - **Batch**: wait for session finalization (timeout or explicit close),
+     then return/display the full result list.
+   - **Inference**: a lightweight watcher subscribes to the results stream and
+     emits/updates a decision as soon as its own early-exit condition is met
+     (e.g. "any method reports `is_bot: true` above confidence X", or "N
+     methods have reported"). This must support **revising** an earlier
+     verdict if later results contradict it — treat inference output as a
+     stream of updates, not a single return value.
+   - Both modes read the *same* append-only result list; they differ only in
+     when/how they surface it. Do not fork the pipeline itself.
+
+9. **Concurrency is required, not optional.** Many sessions run concurrently;
+   within a session, multiple methods may fire concurrently off the same
+   packet event. Use a worker pool from the start (Phase 2) — do not bolt
+   concurrency on after the fact.
+
+10. **Each method owns its own reference/signature database.** No shared
+    global fingerprint DB. p0f has its DB, JA4 has its own (e.g. an ingestible
+    ja4db.foxio.io snapshot), etc. Keep DB loading/lookup inside each method's
+    adapter.
+
+---
+
+## Suggested crate layout
+
+```
+/core       - Packet, Session, ResultEntry, FingerprintMethod trait, TriggerEvent enum
+/capture    - PacketSource trait + pcap-file, live-interface, honeypot-log implementations
+/dispatch   - session correlator, trigger classifier, worker pool dispatch engine
+/methods    - one module per method (p0f adapter, ja3, ja4, ja4h, hassh, fusion, ...),
+              each with its YAML manifest alongside it
+/output     - batch mode + inference mode consumers, dashboard/CLI rendering
+/cli        - binary entrypoint, argument parsing (source selection, mode flag, etc.)
+```
+
+Key crates to use: `serde` + `serde_yaml` (manifests), `pcap` or `etherparse`
+(packet parsing), `tokio` (async dispatch + subprocess handling with timeouts),
+`clap` (CLI).
+
+---
+
+## Build phases
+
+### Phase 0 — Scaffolding & core types
+- Set up the Cargo workspace with the crate layout above.
+- Define `Packet`, `Session`, `ResultEntry`, `TriggerEvent`, the
+  `FingerprintMethod` trait, and the YAML manifest struct.
+- Get manifest parsing working against one **dummy** method (returns a fixed
+  fake result) to validate YAML → trait dispatch before any real
+  fingerprinting logic exists.
+
+### Phase 1 — Capture & session assembly
+- Implement pcap-file ingestion first (deterministic, good for testing).
+- Implement the session correlator: 5-tuple keying, inactivity timeout,
+  growing `Session` object.
+- Add live-interface capture once file-based ingestion is solid.
+- Defer honeypot-log ingestion (Cowrie/Dionaea format) — separate input
+  adapter, not core architecture.
+- Exit criterion: feed a pcap in, print reconstructed sessions, no
+  fingerprinting yet.
+
+### Phase 2 — Trigger/dispatch engine
+- Implement protocol-event classification per packet (SYN, ClientHello, HTTP
+  request line, etc.).
+- Implement trigger lookup + dispatch into a worker pool.
+- Re-implement the Phase 0 dummy method as a real trivial one (e.g. TCP window
+  size + TTL) to validate the full path: pcap → session → trigger → dispatch →
+  result appended to session's list.
+- Exit criterion: real concurrent dispatch across multiple simultaneous
+  sessions, verified with a synthetic multi-flow pcap.
+
+### Phase 3 — Real methods (start with black-box, then in-process)
+- Wrap p0f via subprocess adapter first — validates timeout handling for real
+  external tools.
+- Implement JA3/JA3S, HASSH in-process (hash computations over already-parsed
+  fields).
+- Implement JA4 suite (JA4, JA4H at minimum). Capture HTTP fingerprinting
+  **post-decryption, inside the honeypot process** if traffic is TLS —
+  do not rely on wire-level decryption. Preserve raw header order/casing; do
+  not let any intermediate component (proxy, framework) re-serialize the
+  request before this stage sees it.
+- Exit criterion: 3+ real methods running concurrently over live/pcap traffic,
+  results correctly grouped per session.
+
+### Phase 4 — Output modes & dashboard
+- Implement batch mode: full result dump at session finalization.
+- Build the dashboard/CLI output as a generic consumer keyed on `kind`
+  (classification/flag/score/raw_signature) — must render a brand-new
+  method's output without dashboard code changes, this is the extensibility
+  proof.
+- Implement inference mode as a second consumer over the same result stream,
+  including the "revise on later contradicting evidence" behavior.
+
+### Phase 5 — Fusion method + scanner detection
+- Implement fusion as described above (reads `session.results`, not raw
+  packets).
+- Scanner detection is **cross-session** — treat it as a separate aggregation
+  layer sitting above the per-session pipeline (tracking patterns like many
+  short-lived sessions from one source, minimal/rigid TCP option sets typical
+  of stateless scanners like Zmap/Masscan, no follow-through past handshake),
+  not as one more per-session method.
+
+### Phase 6 — Evaluation harness
+- Batch-mode runner over unlabelled honeypot pcap data, computing %
+  identification: single-method vs combined-tool.
+- Adversarial variant: pipeline to replay pcaps with spoofed/modified
+  fingerprint fields for robustness testing.
+
+### Deferred / stretch (do not start before Phase 0–5 work end-to-end)
+- eBPF-based in-kernel capture/pre-filtering via `aya-rs` (XDP/TC hooks) —
+  purely a capture-layer optimization, does not change any architecture above
+  it. Do not attempt to put fingerprint parsing logic inside eBPF programs
+  (verifier will reject complex variable-length parsing); it should only
+  filter/pre-classify packets before they reach userspace.
+
+---
+
+## Non-negotiable constraints to remind the agent of during implementation
+
+- No method's `extract()` implementation may block the dispatch pool
+  indefinitely — subprocess calls always get a timeout.
+- Never overwrite or mutate a `ResultEntry` once appended.
+- Never hardcode a method's output fields into the dashboard/output layer —
+  always go through the YAML-declared schema + `kind`.
+- Do not add a new output `kind` to satisfy one method; reuse the existing
+  four unless there's a genuine structural need.
+- Keep the capture source, session correlator, and method dispatch as three
+  separable components at all times — a live-vs-pcap switch, or an
+  eBPF-vs-libpcap capture backend, should never require touching dispatch or
+  method code.

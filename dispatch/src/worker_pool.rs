@@ -22,7 +22,7 @@ pub struct Job {
 
 pub struct Dispatcher {
     jobs: Sender<Job>,
-    workers: Vec<thread::JoinHandle<()>>,
+    workers: Vec<thread::JoinHandle<()>>, // cpu count
 }
 
 impl Dispatcher {
@@ -31,8 +31,12 @@ impl Dispatcher {
     /// Results arrive on the returned receiver, unordered — two sessions
     /// finishing on different threads have no defined relative order, so the
     /// consumer must not depend on one.
+    /// 
+    /// Arc defines a thread-safe reference-counting pointer, which allows multiple threads to share ownership of the same data. 
+    /// In this case, it is used to share the `Registry` instance among the worker threads.
     pub fn spawn(registry: Arc<Registry>, workers: usize) -> (Self, Receiver<Vec<Evidence>>) {
-        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+        // message queue for jobs to be processed by worker threads
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>(); 
         let (result_tx, result_rx) = crossbeam_channel::unbounded::<Vec<Evidence>>();
 
         let handles = (0..workers.max(1))

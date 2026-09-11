@@ -1,0 +1,31 @@
+name: tcp-syn
+description: >
+  p0f-style OS and stack fingerprinting from the TCP SYN: window size, options
+  order, TTL, MSS. Needs only the first packet, which is often all a scanner
+  sends.
+enabled: true
+
+# Satisfied by the very first packet, so this method effectively always runs.
+required-stage: connect
+
+invocation:
+  trigger: stage-reached
+  priority: 100
+  budget-ms: 50
+
+database:
+  path: ../db/p0f.fp
+  format: p0f
+
+output:
+  fields:
+    - name: os
+      description: Operating system family and version.
+    - name: stack
+      description: TCP/IP stack, when it differs from the OS (raw-socket tools).
+    - name: distance
+      description: Estimated hop count from the initial TTL.
+
+params:
+  # Reject signature matches below this similarity.
+  min-score: 0.8

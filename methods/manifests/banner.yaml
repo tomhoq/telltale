@@ -1,0 +1,27 @@
+name: banner
+description: >
+  Client software identification from plaintext banners and request headers —
+  User-Agent, SSH version strings, and similar.
+enabled: true
+
+required-stage: app-data
+
+invocation:
+  trigger: stage-reached
+  priority: 80
+  budget-ms: 50
+
+database:
+  path: ../db/banners.yaml
+  format: rules
+
+output:
+  fields:
+    - name: client
+    - name: vendor
+    - name: version
+
+params:
+  # Never scan more than this much payload; a large transfer must not make the
+  # method expensive.
+  max-bytes: 4096

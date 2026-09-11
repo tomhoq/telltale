@@ -1,0 +1,30 @@
+name: fusion
+description: >
+  Combines multi-layer evidence from other methods to consolidate intruder
+  characteristics (OS, client stack) and infer an overall classification or verdict.
+enabled: true
+
+# Runs on whatever exists, however little.
+required-stage: connect
+
+invocation:
+  # Lowest priority so the evidence it combines is already in the context.
+  trigger: session-end
+  priority: -100
+  budget-ms: 100
+
+output:
+  fields:
+    - name: verdict
+      description: scanner | benign | unknown
+
+params:
+  # Score at or above which the endpoint is called a scanner.
+  threshold: 0.7
+  # Per-signal weights. This block is the knob to sweep when tuning.
+  weights:
+    ja4-known-scanner: 0.6
+    banner-known-tool: 0.5
+    os-client-mismatch: 0.3
+    no-app-data: 0.2
+    session-abandoned: 0.2
