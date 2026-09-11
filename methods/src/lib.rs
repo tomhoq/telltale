@@ -14,4 +14,4 @@ pub mod adapters;
 pub mod db;
 pub mod registry;
 
-pub use registry::{builtin_adapters, AdapterFactory, Registry};
+pub use registry::{builtin_adapters, AdapterFactory, Registry, SessionMemo};

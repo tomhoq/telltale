@@ -84,7 +84,7 @@ fn main() -> pf_core::Result<()> {
         Some(path) => PipelineConfig::load(path)?,
         None => PipelineConfig::default(),
     };
-    let registry = Registry::load_dir(&config.manifest_dir)?;
+    let registry = Registry::load_dir(&config.manifest_dir)?; // reads every yaml file in path
 
     if let Command::Methods = cli.command {
         for name in registry.names() {
@@ -117,23 +117,29 @@ fn run(
     config: &PipelineConfig,
     format: Format,
 ) -> pf_core::Result<()> {
+    let streaming = config.output == OutputMode::InferenceTime;
+    let every_observation = registry.wants_every_observation();
     let (dispatcher, results) = Dispatcher::spawn(Arc::new(registry), config.workers);
     let mut assembler = Assembler::new(config.session_timeout());
 
-    while let Some(observation) = source.next_observation()? {
+    while let Some(observation) = source.next_observation()? { // blocked until next observation is available
         let now = observation.at;
 
-        match assembler.ingest(observation) {
-            Emitted::Opened(key) | Emitted::Updated(key) => {
-                // In streaming mode every new observation is a chance to refine
-                // the verdict; in batch mode we wait for the session to finish.
-                if config.output == OutputMode::InferenceTime {
-                    if let Some(session) = assembler.get(&key) {
-                        submit(&dispatcher, session.clone(), false);
-                    }
-                }
+        // In streaming mode, a session is re-analysed whenever its answer can
+        // change: when it reaches a stage that opens some method's gate, or on
+        // every packet if a method asked for that. Each pass is the whole
+        // answer so far and replaces the previous one. In batch mode we wait
+        // for the session to finish.
+        let provisional_pass = match assembler.ingest(observation) {
+            Emitted::Opened(key) | Emitted::Advanced(key) => streaming.then_some(key),
+            Emitted::Updated(key) => (streaming && every_observation).then_some(key),
+            Emitted::Finished(session) => {
+                submit(&dispatcher, session, true);
+                None
             }
-            Emitted::Finished(session) => submit(&dispatcher, session, true),
+        };
+        if let Some(session) = provisional_pass.and_then(|key| assembler.get(&key)) {
+            submit(&dispatcher, session.clone(), false);
         }
 
         // The timeout is what stops a method that is waiting on a stage from

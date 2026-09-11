@@ -6,9 +6,13 @@ use pf_core::{Observation, Session, SessionKey, SessionState, Stage};
 /// What the assembler/correlator wants the dispatcher to do after ingesting one observation.
 #[derive(Debug, Clone)]
 pub enum Emitted {
-    /// A new session appeared.
+    /// A new session appeared. Its first stage is reached.
     Opened(SessionKey),
-    /// An existing session grew. Streaming-mode methods re-run here.
+    /// An existing session reached a new stage, so methods gated on it can
+    /// now run. Streaming mode re-analyses here.
+    Advanced(SessionKey),
+    /// An existing session grew without changing stage. Only
+    /// `every-observation` methods have anything new to say.
     Updated(SessionKey),
     /// The session is finished — closed or timed out — and will not change again.
     Finished(Session),
@@ -47,11 +51,14 @@ impl Assembler {
 
         match self.sessions.get_mut(&key) {
             Some(session) => {
-                session.push(observation);
                 // TODO: infer stage transitions from the packet itself
                 // (SYN/ACK -> Established, ClientHello -> TlsClientHello,
                 // FIN/RST -> Closed) instead of relying only on stage_hint.
-                Emitted::Updated(key)
+                if session.push(observation) {
+                    Emitted::Advanced(key)
+                } else {
+                    Emitted::Updated(key)
+                }
             }
             None => {
                 self.sessions.insert(key, Session::open(observation));

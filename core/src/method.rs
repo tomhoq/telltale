@@ -10,7 +10,8 @@ use crate::session::Session;
 /// needs is already there.
 pub struct Context<'a> {
     pub session: &'a Session,
-    /// Evidence from higher-priority methods, this pass only.
+    /// Evidence from higher-priority methods: what they concluded this pass,
+    /// or in an earlier pass if they had already settled.
     pub evidence: &'a [Evidence],
     /// True when the session is closed or timed out and will not grow again.
     pub is_final: bool,

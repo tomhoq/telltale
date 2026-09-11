@@ -72,10 +72,13 @@ pub struct Invocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Trigger {
-    /// Run once, the first time `required_stage` is reached.
+    /// Run once, the first time `required_stage` is reached; its result is
+    /// reused for the rest of the session. Run again only if it returned
+    /// `Outcome::Partial`, which asks for more of the session.
     StageReached,
-    /// Re-run on every new observation once the stage is reached. Streaming mode
-    /// only; requires `extract()` to be idempotent over the session-so-far.
+    /// Re-run on every new observation once the stage is reached, whatever it
+    /// returned last time. Streaming mode only; requires `extract()` to be
+    /// idempotent over the session-so-far.
     EveryObservation,
     /// Run once when the session closes or times out.
     SessionEnd,

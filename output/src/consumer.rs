@@ -1,38 +1,38 @@
 //! Batch and inference mode consumers.
 
 use crossbeam_channel::Receiver;
-use pf_core::{Evidence, ProfileStore};
+use pf_core::{ProfileStore, Report};
 
-/// Consumes evidence batches after sessions are finished.
+/// Consumes reports after sessions are finished.
 pub struct BatchConsumer;
 
 impl BatchConsumer {
-    /// Collect all incoming evidence batches into a [`ProfileStore`].
-    pub fn consume(results: Receiver<Vec<Evidence>>) -> ProfileStore {
+    /// Collect every report into a [`ProfileStore`].
+    pub fn consume(results: Receiver<Report>) -> ProfileStore {
         let mut store = ProfileStore::new();
-        for batch in results {
-            for evidence in batch {
-                store.record(evidence);
-            }
+        for report in results {
+            store.apply(report);
         }
         store
     }
 }
 
-/// An incremental watcher/consumer that can process evidence as it arrives.
+/// An incremental watcher/consumer that can process reports as they arrive.
 pub struct InferenceConsumer;
 
 impl InferenceConsumer {
-    /// Process incoming evidence batches incrementally into a [`ProfileStore`].
-    pub fn consume_streaming<F>(results: Receiver<Vec<Evidence>>, mut on_evidence: F) -> ProfileStore
+    /// Fold reports in as they arrive, calling `on_update` after each one that
+    /// changed the store. Stale reports — superseded before they arrived — do
+    /// not trigger it.
+    pub fn consume_streaming<F>(results: Receiver<Report>, mut on_update: F) -> ProfileStore
     where
-        F: FnMut(&Evidence, &ProfileStore),
+        F: FnMut(&Report, &ProfileStore),
     {
         let mut store = ProfileStore::new();
-        for batch in results {
-            for evidence in batch {
-                store.record(evidence.clone());
-                on_evidence(&evidence, &store);
+        for report in results {
+            // The store keeps its own copy; the callback gets the original.
+            if store.apply(report.clone()) {
+                on_update(&report, &store);
             }
         }
         store

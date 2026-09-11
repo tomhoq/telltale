@@ -48,6 +48,17 @@ impl SessionKey {
     }
 }
 
+/// Identity of one session over time.
+///
+/// The key alone is not enough: once a session times out, the same flow can
+/// open a new session under the same key, and results for the two must not
+/// replace each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId {
+    pub key: SessionKey,
+    pub started_at: SystemTime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionState {
@@ -99,18 +110,32 @@ impl Session {
         }
     }
 
-    pub fn push(&mut self, observation: Observation) {
-        self.last_seen_at = observation.at;
-        if let Some(hint) = observation.stage_hint {
-            self.advance(hint);
+    pub fn id(&self) -> SessionId {
+        SessionId {
+            key: self.key,
+            started_at: self.started_at,
         }
-        self.observations.push(observation);
     }
 
-    /// Stages only move forward.
-    pub fn advance(&mut self, stage: Stage) {
+    /// Append an observation. Returns whether it moved the session to a new
+    /// stage — the moment methods gated on that stage become runnable.
+    pub fn push(&mut self, observation: Observation) -> bool {
+        self.last_seen_at = observation.at;
+        let advanced = match observation.stage_hint {
+            Some(hint) => self.advance(hint),
+            None => false,
+        };
+        self.observations.push(observation);
+        advanced
+    }
+
+    /// Stages only move forward. Returns whether this one did.
+    pub fn advance(&mut self, stage: Stage) -> bool {
         if stage > self.stage {
             self.stage = stage;
+            true
+        } else {
+            false
         }
     }
 
