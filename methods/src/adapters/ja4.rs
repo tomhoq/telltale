@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use pf_core::{Context, Method, MethodManifest, Outcome, Result};
+use pf_core::{Context, Fields, Method, MethodManifest, Result};
 
 pub struct Ja4 {
     manifest: MethodManifest,
@@ -23,15 +23,14 @@ impl Method for Ja4 {
         &self.manifest
     }
 
-    fn extract(&self, ctx: &Context<'_>) -> Result<Outcome> {
-        let session = ctx.session;
-        // The registry guarantees the session reached `tls-client-hello`, so the
-        // hello is somewhere in here.
-        let Some(_hello) = session.from_initiator().find(|o| !o.payload.is_empty()) else {
-            return Ok(Outcome::NotApplicable);
+    fn extract(&self, ctx: &Context<'_>) -> Result<Vec<Fields>> {
+        // Fired by `tls-client-hello`, so this packet starts with the hello.
+        let Some(_hello) = ctx.packet.map(|packet| &packet.payload) else {
+            return Ok(Vec::new());
         };
 
-        // TODO: parse the ClientHello, compute the hash, look it up.
-        Ok(Outcome::NoMatch)
+        // TODO: parse the ClientHello, compute the ja4 hash, look it up. A
+        // hello split across TCP segments needs the segments reassembled first.
+        Ok(Vec::new())
     }
 }

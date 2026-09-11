@@ -1,22 +1,31 @@
 name: fusion
 description: >
-  Combines multi-layer evidence from other methods to consolidate intruder
-  characteristics (OS, client stack) and infer an overall classification or verdict.
+  Combines the other methods' results into an overall verdict. Reads the
+  session's result list, not packets, and appends its own entry.
 enabled: true
+layer: L3
 
-# Runs on whatever exists, however little.
-required-stage: connect
+# Fires once every other method the session triggered has reported.
+triggers: [session-end]
 
 invocation:
-  # Lowest priority so the evidence it combines is already in the context.
-  trigger: session-end
-  priority: -100
-  budget-ms: 100
+  type: in-process
+  adapter: fusion
+  timeout-ms: 100
 
-output:
-  fields:
-    - name: verdict
-      description: scanner | benign | unknown
+output-schema:
+  - field: verdict
+    type: string
+    kind: classification
+    description: scanner | unknown
+  - field: score
+    type: float
+    kind: score
+    description: Weighted evidence for "scanner", 0 to 1.
+  - field: methods
+    type: integer
+    kind: score
+    description: How many distinct methods reported on the session.
 
 params:
   # Score at or above which the endpoint is called a scanner.

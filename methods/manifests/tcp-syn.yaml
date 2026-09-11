@@ -1,30 +1,37 @@
 name: tcp-syn
 description: >
-  p0f-style OS and stack fingerprinting from the TCP SYN: window size, options
-  order, TTL, MSS. Needs only the first packet, which is often all a scanner
+  p0f-style stack fingerprinting from the TCP SYN: initial TTL, window size and
+  TCP option order. Needs only the first packet, which is often all a scanner
   sends.
 enabled: true
+layer: L1
 
-# Satisfied by the very first packet, so this method effectively always runs.
-required-stage: connect
+# The client's SYN only. Adding tcp-syn-ack would fingerprint the honeypot's
+# own stack. A full p0f method would also list http-request / http-response.
+triggers: [tcp-syn]
 
 invocation:
-  trigger: stage-reached
-  priority: 100
-  budget-ms: 50
+  type: in-process
+  adapter: tcp-syn
+  timeout-ms: 50
 
 database:
   path: ../db/p0f.fp
   format: p0f
 
-output:
-  fields:
-    - name: os
-      description: Operating system family and version.
-    - name: stack
-      description: TCP/IP stack, when it differs from the OS (raw-socket tools).
-    - name: distance
-      description: Estimated hop count from the initial TTL.
+output-schema:
+  - field: signature
+    type: string
+    kind: raw-signature
+    description: initial-ttl:window:option-layout, e.g. 64:29200:mss,sok,ts,nop,ws
+  - field: distance
+    type: integer
+    kind: score
+    description: Estimated hop count, from the initial TTL.
+  - field: os-family
+    type: string
+    kind: classification
+    description: Stack family from the initial TTL, until the p0f database is loaded.
 
 params:
   # Reject signature matches below this similarity.

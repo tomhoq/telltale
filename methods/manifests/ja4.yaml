@@ -3,23 +3,29 @@ description: >
   TLS ClientHello fingerprinting. A strong scanner signal: mass scanners use a
   small set of TLS stacks and their hashes are well catalogued.
 enabled: true
+layer: L2
 
-required-stage: tls-client-hello
+triggers: [tls-client-hello]
 
 invocation:
-  trigger: stage-reached
-  priority: 90
-  budget-ms: 50
+  type: in-process
+  adapter: ja4
+  timeout-ms: 50
 
 database:
   path: ../db/ja4-known.jsonl
   format: json-lines
 
-output:
-  fields:
-    - name: ja4
-      description: The raw ja4 hash.
-    - name: client
-      description: Labelled client, when the hash is in the list.
-    - name: known-scanner
-      description: Set when the hash belongs to a known scanning tool.
+output-schema:
+  - field: ja4
+    type: string
+    kind: raw-signature
+    description: The ja4 hash.
+  - field: client
+    type: string
+    kind: classification
+    description: Labelled client, when the hash is in the list.
+  - field: known-scanner
+    type: bool
+    kind: flag
+    description: Set when the hash belongs to a known scanning tool.

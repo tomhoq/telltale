@@ -1,15 +1,14 @@
 # Run configuration. Everything here is meant to be swept without recompiling.
 manifest-dir: methods/manifests
 
-# Inactivity timeout for session assembly. When it fires, any method still
-# waiting for its required stage reports a partial result or none — it never
-# holds the session open.
+# Inactivity timeout for session assembly. When it fires, the session ends
+# with whatever results it has — nothing waits for traffic that never came.
 session-timeout-secs: 30
 
-# Worker threads. One job is one session; methods within a session run on one
-# thread so the fusion method can read the others' evidence without locking.
+# Worker threads. One job is one method answering one trigger event, so
+# several methods fired by the same packet run at once.
 workers: 8
 
-# per-session    -> assemble the full session, then score once
-# inference-time -> emit a best guess as data arrives, refine as more comes in
+# per-session    -> batch: each session once it is finalized, with all its results
+# inference-time -> each result the moment a method reports it
 output: per-session

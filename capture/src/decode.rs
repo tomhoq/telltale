@@ -14,12 +14,12 @@
 use std::net::IpAddr;
 use std::time::SystemTime;
 
-use pf_core::{Endpoint, Observation, Stage, Transport};
+use pf_core::{Endpoint, Observation, TcpHeader, Transport};
 use pnet::packet::ethernet::{EtherType, EtherTypes, EthernetPacket};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::{TcpFlags, TcpPacket};
+use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::UdpPacket;
 
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -99,6 +99,7 @@ fn ipv4(packet: &[u8], at: SystemTime) -> Option<Observation> {
         ip.get_next_level_protocol(),
         IpAddr::V4(ip.get_source()),
         IpAddr::V4(ip.get_destination()),
+        ip.get_ttl(),
         &packet[header_len..end],
         at,
     )
@@ -117,6 +118,7 @@ fn ipv6(packet: &[u8], at: SystemTime) -> Option<Observation> {
         ip.get_next_header(),
         IpAddr::V6(ip.get_source()),
         IpAddr::V6(ip.get_destination()),
+        ip.get_hop_limit(),
         &packet[IPV6_HEADER_LEN..end],
         at,
     )
@@ -126,22 +128,28 @@ fn transport(
     protocol: IpNextHeaderProtocol,
     source: IpAddr,
     destination: IpAddr,
+    ttl: u8,
     segment: &[u8],
     at: SystemTime,
 ) -> Option<Observation> {
-    let (transport, source_port, destination_port, payload, stage_hint) = match protocol {
+    let (transport, source_port, destination_port, payload, tcp_header) = match protocol {
         IpNextHeaderProtocols::Tcp => {
             let tcp = TcpPacket::new(segment)?;
             let header_len = tcp.get_data_offset() as usize * 4;
             if !(TCP_MIN_HEADER_LEN..=segment.len()).contains(&header_len) {
                 return None;
             }
+            let header = TcpHeader {
+                flags: tcp.get_flags(),
+                window: tcp.get_window(),
+                options: segment[TCP_MIN_HEADER_LEN..header_len].to_vec(),
+            };
             (
                 Transport::Tcp,
                 tcp.get_source(),
                 tcp.get_destination(),
                 &segment[header_len..],
-                tcp_stage(tcp.get_flags()),
+                Some(header),
             )
         }
         IpNextHeaderProtocols::Udp => {
@@ -171,31 +179,10 @@ fn transport(
             port: destination_port,
         },
         transport,
+        ttl: Some(ttl),
+        tcp: tcp_header,
         payload: payload.to_vec(),
-        stage_hint,
     })
-}
-
-/// What the TCP flags establish on their own, and no more.
-///
-/// FIN and RST deliberately do not map to [`Stage::Closed`]. `Stage` is ordered
-/// and `Closed` is its maximum, so a bare SYN scan answered with a RST would
-/// satisfy every manifest's `required_stage` gate — the exact traffic this tool
-/// exists to catch would look like a completed conversation. Closing is the
-/// assembler's call, made from session lifecycle rather than from one packet.
-///
-/// The flags are not preserved anywhere else: [`Observation`] has no field for
-/// them. A method that needs to distinguish a RST from a FIN will have to add
-/// one.
-fn tcp_stage(flags: u8) -> Option<Stage> {
-    match (flags & TcpFlags::SYN != 0, flags & TcpFlags::ACK != 0) {
-        (true, false) => Some(Stage::Connect),
-        (true, true) => Some(Stage::Established),
-        // A mid-stream segment proves the handshake happened but says nothing
-        // about what its bytes are; the assembler reads the payload for that.
-        (false, true) => Some(Stage::Established),
-        (false, false) => None,
-    }
 }
 
 #[cfg(test)]
@@ -223,12 +210,26 @@ mod tests {
     }
 
     fn tcp(source: u16, destination: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
+        tcp_with_options(source, destination, flags, &[], payload)
+    }
+
+    /// `options` must be a multiple of 4 bytes, as on the wire.
+    fn tcp_with_options(
+        source: u16,
+        destination: u16,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let words = (TCP_MIN_HEADER_LEN + options.len()) / 4;
         let mut segment = Vec::new();
         segment.extend_from_slice(&source.to_be_bytes());
         segment.extend_from_slice(&destination.to_be_bytes());
         segment.extend_from_slice(&[0; 8]); // seq + ack
-        segment.extend_from_slice(&[0x50, flags]); // data offset 5 words, flags
-        segment.extend_from_slice(&[0; 6]); // window + checksum + urgent
+        segment.extend_from_slice(&[(words as u8) << 4, flags]); // data offset, flags
+        segment.extend_from_slice(&29200u16.to_be_bytes()); // window
+        segment.extend_from_slice(&[0; 4]); // checksum + urgent
+        segment.extend_from_slice(options);
         segment.extend_from_slice(payload);
         segment
     }
@@ -245,7 +246,7 @@ mod tests {
 
     #[test]
     fn decodes_a_tcp_syn() {
-        let frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpFlags::SYN, &[])));
+        let frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpHeader::SYN, &[])));
         let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
 
         assert_eq!(observation.source.addr, IpAddr::from(SRC));
@@ -253,26 +254,33 @@ mod tests {
         assert_eq!(observation.destination.addr, IpAddr::from(DST));
         assert_eq!(observation.destination.port, 22);
         assert_eq!(observation.transport, Transport::Tcp);
-        assert_eq!(observation.stage_hint, Some(Stage::Connect));
+        assert_eq!(observation.ttl, Some(64));
+        let tcp = observation.tcp.expect("a TCP packet has a TCP header");
+        assert_eq!(tcp.flags, TcpHeader::SYN);
+        assert_eq!(tcp.window, 29200);
         assert!(observation.payload.is_empty());
     }
 
+    /// Option order is a fingerprint, so the block must come through byte for
+    /// byte and must not be mistaken for payload.
     #[test]
-    fn syn_ack_and_mid_stream_segments_are_established() {
-        for flags in [TcpFlags::SYN | TcpFlags::ACK, TcpFlags::PSH | TcpFlags::ACK] {
-            let frame = ethernet(0x0800, &ipv4(6, &tcp(22, 51234, flags, b"hello")));
-            let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
-            assert_eq!(observation.stage_hint, Some(Stage::Established));
-        }
+    fn tcp_options_are_kept_verbatim_and_apart_from_the_payload() {
+        let options = [0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x07]; // MSS 1460, NOP, WS 7
+        let frame = ethernet(
+            0x0800,
+            &ipv4(6, &tcp_with_options(51234, 22, TcpHeader::SYN, &options, b"data")),
+        );
+        let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
+
+        assert_eq!(observation.tcp.unwrap().options, options);
+        assert_eq!(observation.payload, b"data");
     }
 
-    /// A RST must not advance the session past the stages a method needs, or a
-    /// refused SYN scan would satisfy every `required_stage` gate.
     #[test]
-    fn rst_does_not_report_a_stage() {
-        let frame = ethernet(0x0800, &ipv4(6, &tcp(22, 51234, TcpFlags::RST, &[])));
+    fn udp_has_no_tcp_header() {
+        let frame = ethernet(0x0800, &ipv4(17, &udp(51234, 53, b"query")));
         let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
-        assert_eq!(observation.stage_hint, None);
+        assert!(observation.tcp.is_none());
     }
 
     #[test]
@@ -280,7 +288,7 @@ mod tests {
         let tagged = {
             let mut payload = vec![0x00, 0x2a]; // priority + VLAN id 42
             payload.extend_from_slice(&0x0800u16.to_be_bytes());
-            payload.extend_from_slice(&ipv4(6, &tcp(51234, 443, TcpFlags::SYN, &[])));
+            payload.extend_from_slice(&ipv4(6, &tcp(51234, 443, TcpHeader::SYN, &[])));
             ethernet(0x8100, &payload)
         };
 
@@ -308,14 +316,14 @@ mod tests {
 
     #[test]
     fn a_lying_header_length_is_rejected_not_trusted() {
-        let mut frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpFlags::SYN, &[])));
+        let mut frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpHeader::SYN, &[])));
         frame[ETHERNET_HEADER_LEN] = 0x4f; // IHL 15 words, past the end
         assert!(ethernet_frame(&frame, SystemTime::UNIX_EPOCH).is_none());
     }
 
     #[test]
     fn non_initial_fragments_are_dropped() {
-        let mut frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpFlags::SYN, &[])));
+        let mut frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpHeader::SYN, &[])));
         frame[ETHERNET_HEADER_LEN + 6] = 0x00;
         frame[ETHERNET_HEADER_LEN + 7] = 0xb9; // fragment offset != 0
         assert!(ethernet_frame(&frame, SystemTime::UNIX_EPOCH).is_none());

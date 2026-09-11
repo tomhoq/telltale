@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use pcap_file::pcap::{PcapPacket, PcapWriter};
 use pf_capture::sources::PcapFileSource;
 use pf_capture::Source;
-use pf_core::{Stage, Transport};
+use pf_core::{TcpHeader, Transport};
 
 fn make_tcp_syn_frame(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
     let mut frame = vec![0xff; 12];
@@ -65,7 +65,7 @@ fn test_pcap_replay_full_flow() {
         assert_eq!(obs.source.addr.to_string(), "198.51.100.42");
         assert_eq!(obs.destination.addr.to_string(), "192.168.1.10");
         assert_eq!(obs.transport, Transport::Tcp);
-        assert_eq!(obs.stage_hint, Some(Stage::Connect));
+        assert_eq!(obs.tcp.as_ref().map(|t| t.flags), Some(TcpHeader::SYN));
         observed_ports.push(obs.destination.port);
         timestamps.push(obs.at);
     }

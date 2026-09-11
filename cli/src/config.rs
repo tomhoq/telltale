@@ -15,29 +15,27 @@ pub struct PipelineConfig {
     #[serde(default = "default_manifest_dir")]
     pub manifest_dir: String,
 
-    /// Inactivity timeout for session assembly, in seconds. When it fires,
-    /// methods still waiting on a stage report partial or no result rather than
-    /// holding the session open.
+    /// Inactivity timeout for session assembly, in seconds. When it fires, the
+    /// session ends with whatever results it has; nothing waits for traffic
+    /// that never came.
     #[serde(default = "default_timeout_secs")]
     pub session_timeout_secs: u64,
 
-    /// Worker threads. One job is one session.
+    /// Worker threads. One job is one method answering one trigger event.
     #[serde(default = "default_workers")]
     pub workers: usize,
 
     pub output: OutputMode,
 }
 
-/// The decision that shapes everything else.
+/// How results are surfaced. Both read the same result stream; the pipeline
+/// runs identically either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutputMode {
-    /// Assemble the whole session, then score it once. Simpler and more
-    /// accurate; useless for anything that has to react while traffic flows.
+    /// Batch: each session once it is finalized, with its full result list.
     PerSession,
-    /// Emit a best guess as data arrives and refine it. Requires every method to
-    /// be re-runnable on partial data — which the `Method` contract already
-    /// demands, so both modes work against the same adapters.
+    /// Inference: each result the moment a method reports it.
     InferenceTime,
 }
 

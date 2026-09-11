@@ -7,11 +7,17 @@ set of fingerprinting methods declared in YAML. A fusion method combines multi-l
 observations into a cohesive profile and verdict.
 
 ```
-source ──▶ Assembler ──▶ Dispatcher ──▶ Registry ──▶ ProfileStore ──▶ output
-(live/pcap/   (5-tuple +   (worker pool,   (methods, by
- tcpdump/      timeout)     1 job =         priority)
- honeypot)                  1 session)
+source ──▶ Assembler ──▶ classifier ──▶ worker pool ──▶ session results ──▶ output
+(live/pcap/  (5-tuple +    (packet ->     (1 job = 1       (append-only;      (batch or
+ tcpdump/     timeout)      tcp-syn,       method x 1       result stream)     inference
+ honeypot)                  tls-client-    event)                              consumer)
+                            hello, ...)
 ```
+
+Each packet is classified into protocol events; every method whose manifest
+lists that event runs once, with that packet. A method is never re-run on
+packets it has already seen. When a session ends, `session-end` methods
+(fusion) run once everything else has reported, reading the full result list.
 
 ## Layout
 
@@ -34,10 +40,15 @@ configurations should not need a recompile.
 
 A new **method**:
 
-1. `methods/manifests/<name>.yaml` — required stage, trigger, priority, database,
-   output schema, params;
+1. `methods/manifests/<name>.yaml` — `layer`, `triggers` (the protocol events
+   that fire it), `invocation` (in-process adapter, or external command),
+   database, `output-schema` (`{field, type, kind}`, kind being one of
+   `classification`, `flag`, `score`, `raw-signature`), params;
 2. an adapter in `methods/src/adapters/` implementing `pf_core::Method`;
 3. one line in `pf_methods::registry::builtin_adapters`.
+
+A method needing an event nobody has used yet also needs it added to
+`pf_core::TriggerEvent` and recognised in `pf_dispatch::classifier`.
 
 Re-tuning an existing method is step 1 alone. `cargo test -p pf-methods` checks
 every shipped manifest still pairs with an adapter.
@@ -47,14 +58,15 @@ add a CLI subcommand.
 
 ## Key rules
 
-- **Methods are pure and idempotent** over the session-so-far. That is what lets
-  them run in parallel, and what makes both output modes work against the same
-  adapters.
+- **Methods are pure.** That is what lets many run at once, including several
+  off the same packet.
+- **Results are append-only.** Nothing merges, replaces or deduplicates at
+  storage; reconciling methods is a consumer's job (fusion, inference).
 - **Each method owns its database.** No shared signature table.
-- **The timeout always wins.** A method waiting on a stage that never arrives
-  reports partial or no result; it never holds a session open.
-- **A method failure is logged, not fatal.** One broken method must not sink the
-  session.
+- **The timeout always wins.** A quiet session ends with whatever results it
+  has; nothing waits for traffic that never came.
+- **A method failure is logged, not fatal.** One broken (or panicking) method
+  must not sink the session.
 
 ## Prerequisites
 
@@ -101,10 +113,13 @@ brew install libpcap
 
 ```bash
 cargo run -p pf-cli -- --config config/pipeline.yaml methods
+cargo run -p pf-cli -- --config config/pipeline.yaml replay -p capture/tests/fixtures/sample_syn_scan.pcap
 ```
 
-## Still to decide
+## Output modes
 
-`config/pipeline.yaml`'s `output:` — `per-session` (batch: assemble, then score)
-vs `inference-time` (streaming: guess early, refine). The scaffold supports both;
-if batch wins, `Outcome::Partial` and the re-dispatch loop can be deleted.
+`config/pipeline.yaml`'s `output:` picks the consumer, not the pipeline: both
+read the same result stream. `per-session` (batch) prints each session once it
+is finalized, with its full result list; `inference-time` prints each result
+the moment a method reports it. Still to come for inference: a watcher that
+emits a verdict early and revises it when later results contradict it.

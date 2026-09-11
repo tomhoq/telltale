@@ -7,7 +7,7 @@ use crate::Source;
 /// Ingests a honeypot's structured log.
 ///
 /// The odd one out: there are no packets here, so `payload` is often empty and
-/// the log's own semantics supply `stage_hint` directly. Methods that need raw
+/// the log's own semantics say what happened (a login, a command). Methods that need raw
 /// bytes will correctly report `NotApplicable` on these sessions — that is the
 /// design working, not a gap.
 pub struct HoneypotLogSource {
@@ -36,7 +36,7 @@ impl Source for HoneypotLogSource {
 
     fn next_observation(&mut self) -> Result<Option<Observation>> {
         // TODO: one deserializer per honeypot format, each mapping its records
-        // onto Observation + stage_hint.
+        // onto Observation, and deciding how its events reach the trigger classifier.
         Err(Error::Capture(format!(
             "honeypot log format `{}` is not implemented yet",
             self.format
