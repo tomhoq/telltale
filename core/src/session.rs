@@ -3,27 +3,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::observation::{Direction, Endpoint, Observation, Transport};
-
-/// How far a session has progressed.
-///
-/// Declaration order is significant: `Ord` is derived, and a manifest's
-/// `required_stage` is satisfied when the session has reached a stage that is
-/// greater than or equal to it. Insert new stages in the right place, not at the
-/// end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Stage {
-    /// First packet seen; for TCP that is the SYN.
-    Connect,
-    /// Transport handshake complete.
-    Established,
-    /// TLS ClientHello observed (what ja4-style methods need).
-    TlsClientHello,
-    /// Application bytes flowing in either direction.
-    AppData,
-    /// Peer closed, or the timeout fired.
-    Closed,
-}
+use crate::result::ResultEntry;
 
 /// Canonical, direction-independent identity of a flow.
 ///
@@ -48,36 +28,47 @@ impl SessionKey {
     }
 }
 
+/// Identity of one session over time.
+///
+/// The key alone is not enough: once a session times out, the same flow can
+/// open a new session under the same key, and results for the two must not
+/// be mixed up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId {
+    pub key: SessionKey,
+    pub started_at: SystemTime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionState {
     Active,
-    /// Closed cleanly by a peer.
+    /// Finished because the source ran out.
     Closed,
-    /// The inactivity timeout fired. Methods still run, but anything that needed
-    /// a stage this session never reached reports partial or no result rather
-    /// than holding the session open.
+    /// The inactivity timeout fired. Whatever results exist are the session's
+    /// results; nothing waits for traffic that never came.
     TimedOut,
 }
 
-/// The unit of work handed to methods.
+/// Everything seen so far in one flow, and everything methods said about it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub key: SessionKey,
-    /// Whoever sent the first observation. For scanner detection this is the
-    /// endpoint being judged.
+    /// Whoever sent the first observation — for a honeypot, the client being
+    /// fingerprinted.
     pub initiator: Endpoint,
     pub started_at: SystemTime,
     pub last_seen_at: SystemTime,
     pub state: SessionState,
-    /// Furthest stage reached, monotonic.
-    pub stage: Stage,
     /// Observations in arrival order.
     ///
     /// TODO: cap this. A scanner hammering one port should not be able to grow a
     /// session unboundedly — decide on a ring buffer or a byte budget before
     /// this runs against real traffic.
     pub observations: Vec<Observation>,
+    /// Append-only. Entries are added as methods report and are never edited
+    /// or removed.
+    pub results: Vec<ResultEntry>,
 }
 
 impl Session {
@@ -87,35 +78,32 @@ impl Session {
             observation.destination,
             observation.transport,
         );
-        let stage = observation.stage_hint.unwrap_or(Stage::Connect);
         Self {
             key,
             initiator: observation.source,
             started_at: observation.at,
             last_seen_at: observation.at,
             state: SessionState::Active,
-            stage,
             observations: vec![observation],
+            results: Vec::new(),
+        }
+    }
+
+    pub fn id(&self) -> SessionId {
+        SessionId {
+            key: self.key,
+            started_at: self.started_at,
         }
     }
 
     pub fn push(&mut self, observation: Observation) {
         self.last_seen_at = observation.at;
-        if let Some(hint) = observation.stage_hint {
-            self.advance(hint);
-        }
         self.observations.push(observation);
     }
 
-    /// Stages only move forward.
-    pub fn advance(&mut self, stage: Stage) {
-        if stage > self.stage {
-            self.stage = stage;
-        }
-    }
-
-    pub fn reached(&self, stage: Stage) -> bool {
-        self.stage >= stage
+    /// The only way results enter a session.
+    pub fn append(&mut self, entry: ResultEntry) {
+        self.results.push(entry);
     }
 
     pub fn direction_of(&self, observation: &Observation) -> Direction {

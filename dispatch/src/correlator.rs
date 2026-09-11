@@ -1,23 +1,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use pf_core::{Observation, Session, SessionKey, SessionState, Stage};
-
-/// What the assembler/correlator wants the dispatcher to do after ingesting one observation.
-#[derive(Debug, Clone)]
-pub enum Emitted {
-    /// A new session appeared.
-    Opened(SessionKey),
-    /// An existing session grew. Streaming-mode methods re-run here.
-    Updated(SessionKey),
-    /// The session is finished — closed or timed out — and will not change again.
-    Finished(Session),
-}
+use pf_core::{Observation, Session, SessionId, SessionKey, SessionState};
 
 /// 5-tuple + timeout session correlation.
 ///
-/// Single-threaded on purpose: this sits on the capture thread and hands
-/// completed work to the worker pool, so it never needs a lock.
+/// Single-threaded on purpose: this sits on the capture thread, so it never
+/// needs a lock.
 pub struct Assembler {
     timeout: Duration,
     sessions: HashMap<SessionKey, Session>,
@@ -34,37 +23,39 @@ impl Assembler {
         }
     }
 
-    pub fn get(&self, key: &SessionKey) -> Option<&Session> {
-        self.sessions.get(key)
-    }
-
-    pub fn ingest(&mut self, observation: Observation) -> Emitted {
+    /// Add an observation to its session, opening one if this flow has none.
+    /// Returns the session's key.
+    pub fn ingest(&mut self, observation: Observation) -> SessionKey {
         let key = SessionKey::new(
             observation.source,
             observation.destination,
             observation.transport,
         );
-
         match self.sessions.get_mut(&key) {
-            Some(session) => {
-                session.push(observation);
-                // TODO: infer stage transitions from the packet itself
-                // (SYN/ACK -> Established, ClientHello -> TlsClientHello,
-                // FIN/RST -> Closed) instead of relying only on stage_hint.
-                Emitted::Updated(key)
-            }
+            Some(session) => session.push(observation),
             None => {
                 self.sessions.insert(key, Session::open(observation));
-                Emitted::Opened(key)
             }
         }
+        key
+    }
+
+    pub fn get(&self, key: &SessionKey) -> Option<&Session> {
+        self.sessions.get(key)
+    }
+
+    /// The open session with exactly this identity — not a newer session that
+    /// has since opened under the same key.
+    pub fn find_mut(&mut self, id: &SessionId) -> Option<&mut Session> {
+        self.sessions
+            .get_mut(&id.key)
+            .filter(|session| session.started_at == id.started_at)
     }
 
     /// Close out every session idle for longer than the timeout.
     ///
-    /// This is the mechanism behind the "no blocking" rule: a session whose
-    /// methods are still waiting for a stage that never arrived gets finished
-    /// anyway, and those methods report partial or no result.
+    /// This is what keeps the pipeline from ever waiting on traffic: a session
+    /// that went quiet is finished with whatever results it has.
     pub fn expire(&mut self, now: SystemTime) -> Vec<Session> {
         let stale: Vec<SessionKey> = self
             .sessions
@@ -73,29 +64,31 @@ impl Assembler {
             .map(|(k, _)| *k)
             .collect();
 
-        stale
+        let mut expired: Vec<Session> = stale
             .into_iter()
             .filter_map(|key| self.sessions.remove(&key))
             .map(|mut session| {
                 session.state = SessionState::TimedOut;
-                session.advance(Stage::Closed);
                 session
             })
-            .collect()
+            .collect();
+        expired.sort_by_key(|session| session.started_at);
+        expired
     }
 
     /// Finish everything still open — call once the source is exhausted.
+    /// Oldest first, so output follows the capture rather than hash order.
     pub fn drain(&mut self) -> Vec<Session> {
-        self.sessions
+        let mut sessions: Vec<Session> = self
+            .sessions
             .drain()
             .map(|(_, mut session)| {
-                if session.state == SessionState::Active {
-                    session.state = SessionState::Closed;
-                }
-                session.advance(Stage::Closed);
+                session.state = SessionState::Closed;
                 session
             })
-            .collect()
+            .collect();
+        sessions.sort_by_key(|session| session.started_at);
+        sessions
     }
 
     pub fn len(&self) -> usize {

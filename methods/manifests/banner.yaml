@@ -1,27 +1,32 @@
 name: banner
 description: >
   Client software identification from plaintext banners and request headers —
-  User-Agent, SSH version strings, and similar.
+  SSH identification strings and HTTP User-Agents.
 enabled: true
+layer: L3
 
-required-stage: app-data
+triggers: [ssh-banner, http-request]
 
 invocation:
-  trigger: stage-reached
-  priority: 80
-  budget-ms: 50
+  type: in-process
+  adapter: banner
+  timeout-ms: 50
 
 database:
   path: ../db/banners.yaml
   format: rules
 
-output:
-  fields:
-    - name: client
-    - name: vendor
-    - name: version
+output-schema:
+  - field: protocol
+    type: string
+    kind: classification
+    description: Where the banner came from, ssh or http.
+  - field: client
+    type: string
+    kind: raw-signature
+    description: The client software string as sent.
 
 params:
-  # Never scan more than this much payload; a large transfer must not make the
+  # Never scan more than this much payload; a large request must not make the
   # method expensive.
   max-bytes: 4096

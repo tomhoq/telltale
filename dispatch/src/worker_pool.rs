@@ -1,23 +1,35 @@
-//! Worker pool: one job is one session, and each worker runs the whole registry
-//! over it.
+//! Worker pool: one job is one method answering one trigger.
 //!
-//! Sharding by session rather than by method keeps every method's view of a
-//! session on one thread, which is what lets [`pf_core::Method::extract`] stay
-//! lock-free — and it lets the fusion method see the other methods' evidence
-//! without any cross-thread coordination.
+//! Jobs share one queue, so any worker takes any job: many sessions run at
+//! once, and within a session several methods fired by the same packet run at
+//! once too. Methods cannot block each other, and nothing here waits on a
+//! particular job.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
-use pf_core::{Evidence, Session};
-use pf_methods::Registry;
+use pf_core::{Context, ResultEntry, Session, SessionId, TriggerEvent};
+use pf_methods::{MethodId, Registry};
 
 /// One unit of work.
 pub struct Job {
-    pub session: Session,
-    /// The session is closed or timed out; this is its last pass.
-    pub is_final: bool,
+    pub method: MethodId,
+    pub trigger: TriggerEvent,
+    /// The session as it was when the event fired. Shared by every method the
+    /// event fired, and read-only.
+    pub session: Arc<Session>,
+    /// Index into `session.observations` of the packet that raised the event;
+    /// `None` for session events.
+    pub packet: Option<usize>,
+}
+
+/// A finished job. Sent for every job, even one that found nothing, so the
+/// engine can tell when a session has nothing left in flight.
+pub struct Done {
+    pub session: SessionId,
+    pub results: Vec<ResultEntry>,
 }
 
 pub struct Dispatcher {
@@ -28,30 +40,30 @@ pub struct Dispatcher {
 impl Dispatcher {
     /// Spawn `workers` threads sharing one registry.
     ///
-    /// Results arrive on the returned receiver, unordered — two sessions
-    /// finishing on different threads have no defined relative order, so the
-    /// consumer must not depend on one.
-    /// 
-    /// Arc defines a thread-safe reference-counting pointer, which allows multiple threads to share ownership of the same data. 
+    /// Arc defines a thread-safe reference-counting pointer, which allows multiple threads to share ownership of the same data.
     /// In this case, it is used to share the `Registry` instance among the worker threads.
-    pub fn spawn(registry: Arc<Registry>, workers: usize) -> (Self, Receiver<Vec<Evidence>>) {
+    pub fn spawn(registry: Arc<Registry>, workers: usize) -> (Self, Receiver<Done>) {
         // message queue for jobs to be processed by worker threads
-        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>(); 
-        let (result_tx, result_rx) = crossbeam_channel::unbounded::<Vec<Evidence>>();
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+        let (done_tx, done_rx) = crossbeam_channel::unbounded::<Done>();
 
         let handles = (0..workers.max(1))
             .map(|id| {
                 let jobs: Receiver<Job> = job_rx.clone();
-                let results = result_tx.clone();
+                let done = done_tx.clone();
                 let registry = Arc::clone(&registry);
 
                 thread::Builder::new()
                     .name(format!("pf-worker-{id}"))
                     .spawn(move || {
                         for job in jobs {
-                            let evidence = registry.analyze(&job.session, job.is_final);
-                            if results.send(evidence).is_err() {
-                                break; // consumer went away
+                            let results = run(&registry, &job);
+                            let finished = Done {
+                                session: job.session.id(),
+                                results,
+                            };
+                            if done.send(finished).is_err() {
+                                break; // engine went away
                             }
                         }
                     })
@@ -64,7 +76,7 @@ impl Dispatcher {
                 jobs: job_tx,
                 workers: handles,
             },
-            result_rx,
+            done_rx,
         )
     }
 
@@ -82,4 +94,26 @@ impl Dispatcher {
             let _ = worker.join();
         }
     }
+}
+
+/// A panicking method is treated like a failing one: logged, no results. It
+/// must not take its worker down, or the engine would wait forever for a
+/// `Done` that never comes.
+fn run(registry: &Registry, job: &Job) -> Vec<ResultEntry> {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let ctx = Context {
+            trigger: job.trigger,
+            packet: job.packet.map(|index| &job.session.observations[index]),
+            session: &job.session,
+        };
+        registry.run(job.method, &ctx)
+    }));
+    outcome.unwrap_or_else(|_| {
+        tracing::error!(
+            method = %registry.method(job.method).name(),
+            trigger = ?job.trigger,
+            "method panicked"
+        );
+        Vec::new()
+    })
 }

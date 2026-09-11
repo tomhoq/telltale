@@ -1,10 +1,16 @@
-//! Session correlation and worker pool dispatch engine.
+//! Session correlation, trigger classification and worker pool dispatch.
 //!
-//! Groups raw packet observations into [`pf_core::Session`]s and dispatches
-//! analytical fingerprinting jobs to a multi-threaded worker pool.
+//! Groups packet observations into [`pf_core::Session`]s, classifies each
+//! packet into [`pf_core::TriggerEvent`]s, and runs the methods listening for
+//! those events on a multi-threaded worker pool. [`Engine`] ties the three
+//! together.
 
+pub mod classifier;
 pub mod correlator;
+pub mod engine;
 pub mod worker_pool;
 
-pub use correlator::{Assembler, Emitted, SessionCorrelator};
-pub use worker_pool::{Dispatcher, Job};
+pub use classifier::classify;
+pub use correlator::{Assembler, SessionCorrelator};
+pub use engine::Engine;
+pub use worker_pool::{Dispatcher, Done, Job};

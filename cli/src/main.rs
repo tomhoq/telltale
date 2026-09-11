@@ -1,19 +1,22 @@
-//! Wires the pipeline together: source -> assembler -> dispatcher -> store -> output.
+//! Wires the pipeline together: source -> engine (sessions, triggers, workers)
+//! -> result stream -> output.
 //!
 //! Deliberately thin. Anything worth a unit test belongs in a library crate.
 
 mod config;
 mod pick;
 
+use std::io::{self, Write};
 use std::sync::Arc;
+use std::thread;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use pf_capture::sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};
 use pf_capture::Source;
-use pf_core::Session;
-use pf_dispatch::{Assembler, Dispatcher, Emitted, Job};
+use pf_dispatch::Engine;
 use pf_methods::Registry;
-use pf_output::{render_json, render_text, BatchConsumer};
+use pf_output::consumer;
+use pf_output::{render_result_json, render_result_text, render_session_json, render_session_text};
 
 use crate::config::{OutputMode, PipelineConfig};
 
@@ -84,11 +87,17 @@ fn main() -> pf_core::Result<()> {
         Some(path) => PipelineConfig::load(path)?,
         None => PipelineConfig::default(),
     };
-    let registry = Registry::load_dir(&config.manifest_dir)?;
+    let registry = Registry::load_dir(&config.manifest_dir)?; // reads every yaml file in path
 
     if let Command::Methods = cli.command {
-        for name in registry.names() {
-            println!("{name}");
+        for method in registry.iter() {
+            let manifest = method.manifest();
+            let triggers: Vec<String> = manifest
+                .triggers
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect();
+            println!("{:<12} {:?}  {}", manifest.name, manifest.layer, triggers.join(", "));
         }
         return Ok(());
     }
@@ -117,50 +126,49 @@ fn run(
     config: &PipelineConfig,
     format: Format,
 ) -> pf_core::Result<()> {
-    let (dispatcher, results) = Dispatcher::spawn(Arc::new(registry), config.workers);
-    let mut assembler = Assembler::new(config.session_timeout());
+    let (mut engine, updates) =
+        Engine::new(Arc::new(registry), config.session_timeout(), config.workers);
 
-    while let Some(observation) = source.next_observation()? {
-        let now = observation.at;
-
-        match assembler.ingest(observation) {
-            Emitted::Opened(key) | Emitted::Updated(key) => {
-                // In streaming mode every new observation is a chance to refine
-                // the verdict; in batch mode we wait for the session to finish.
-                if config.output == OutputMode::InferenceTime {
-                    if let Some(session) = assembler.get(&key) {
-                        submit(&dispatcher, session.clone(), false);
-                    }
-                }
+    // Output runs beside capture, so a session shows up as soon as it is
+    // finalized (batch) or a result as soon as it is appended (inference),
+    // rather than all at the end.
+    let mode = config.output;
+    let printer = thread::spawn(move || {
+        let mut out = io::stdout().lock();
+        let shown = match mode {
+            OutputMode::PerSession => consumer::batch(updates, |session| {
+                let text = match format {
+                    Format::Text => render_session_text(session),
+                    Format::Json => render_session_json(session),
+                };
+                let _ = out.write_all(text.as_bytes());
+            }),
+            OutputMode::InferenceTime => consumer::inference(updates, |session, initiator, entry| {
+                let text = match format {
+                    Format::Text => render_result_text(session, initiator, entry),
+                    Format::Json => render_result_json(session, initiator, entry),
+                };
+                let _ = out.write_all(text.as_bytes());
+            }),
+        };
+        if shown == 0 {
+            if let Format::Text = format {
+                let _ = writeln!(out, "nothing to report");
             }
-            Emitted::Finished(session) => submit(&dispatcher, session, true),
         }
+    });
 
-        // The timeout is what stops a method that is waiting on a stage from
-        // pinning a session open forever.
-        for session in assembler.expire(now) {
-            submit(&dispatcher, session, true);
+    // blocked until next observation is available
+    let captured = (|| {
+        while let Some(observation) = source.next_observation()? {
+            engine.ingest(observation);
         }
-    }
+        Ok(())
+    })();
 
-    for session in assembler.drain() {
-        submit(&dispatcher, session, true);
-    }
-
-    // Closing the queue lets the workers finish and the result channel close.
-    dispatcher.shutdown();
-
-    // Consume results via pf_output
-    let store = BatchConsumer::consume(results);
-
-    let out = match format {
-        Format::Text => render_text(&store),
-        Format::Json => render_json(&store),
-    };
-    print!("{out}");
-    Ok(())
-}
-
-fn submit(dispatcher: &Dispatcher, session: Session, is_final: bool) {
-    dispatcher.submit(Job { session, is_final });
+    // Even when the source failed part way, finish what was captured: every
+    // open session is ended and published before the output thread stops.
+    engine.finish();
+    printer.join().expect("output thread panicked");
+    captured
 }

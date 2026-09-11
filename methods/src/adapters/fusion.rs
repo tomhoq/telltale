@@ -1,23 +1,26 @@
-//! Combines the other methods into the verdict the tool exists to produce:
-//! is this endpoint an automated scanner?
+//! Combines the other methods' results into one verdict.
+//!
+//! Just another method: it fires on `session-end`, when every other method
+//! the session triggered has already reported, and reads `session.results`
+//! instead of packet bytes. What it concludes is appended as its own entry,
+//! beside the entries it read — nothing is merged in storage.
 //!
 //! Its "database" is combination logic, not a lookup table — which is exactly
-//! why every method owning its own database is the right shape. Runs at the
-//! lowest priority so the evidence it reads is already in the [`Context`].
+//! why every method owning its own database is the right shape.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
-use pf_core::{Confidence, Context, Evidence, Method, MethodManifest, Outcome, Result, Verdict};
+use pf_core::{Context, FieldValue, Fields, Method, MethodManifest, Result};
 
 pub struct Fusion {
     manifest: MethodManifest,
     /// Score at or above which the endpoint is called a scanner. Lives in the
     /// manifest so the threshold can be swept without recompiling.
     threshold: f64,
-    /// Per-method weights, also from the manifest.
+    /// Per-signal weights, also from the manifest.
     ///
-    /// TODO: read these from `params["weights"]` as a map rather than hardcoding
-    /// a single number.
+    /// TODO: read these from `params["weights"]` as a map.
     _weights: (),
 }
 
@@ -35,9 +38,15 @@ impl Method for Fusion {
         &self.manifest
     }
 
-    fn extract(&self, ctx: &Context<'_>) -> Result<Outcome> {
-        if ctx.evidence.is_empty() {
-            return Ok(Outcome::NoMatch);
+    fn extract(&self, ctx: &Context<'_>) -> Result<Vec<Fields>> {
+        let reporting: BTreeSet<&str> = ctx
+            .session
+            .results
+            .iter()
+            .map(|entry| entry.method.as_str())
+            .collect();
+        if reporting.is_empty() {
+            return Ok(Vec::new());
         }
 
         // TODO: the actual scoring. Signals worth weighing, roughly in order of
@@ -46,29 +55,22 @@ impl Method for Fusion {
         //   - a banner naming a scanning tool
         //   - an OS/stack fingerprint inconsistent with the claimed client
         //   - session shape: connect-then-abandon, no app data, very short life
-        //   - across sessions: many destinations from one source (needs state
-        //     the ProfileStore holds, not this session — decide where that lives)
+        // Cross-session patterns (one source, many destinations) belong to the
+        // separate scanner-detection layer above sessions, not here.
         let score = 0.0_f64;
-
         let verdict = if score >= self.threshold {
-            Verdict::Scanner
+            "scanner"
         } else {
-            Verdict::Unknown
+            "unknown"
         };
 
-        let evidence = Evidence::new(
-            self.name(),
-            ctx.session.initiator,
-            "verdict",
-            format!("{verdict:?}").to_lowercase(),
-            Confidence::Weak,
-        );
-
-        // Not final until the session is: more traffic can change the verdict.
-        Ok(if ctx.is_final {
-            Outcome::Complete(vec![evidence])
-        } else {
-            Outcome::Partial(vec![evidence])
-        })
+        Ok(vec![Fields::from([
+            ("verdict".to_string(), FieldValue::from(verdict)),
+            ("score".to_string(), FieldValue::from(score)),
+            (
+                "methods".to_string(),
+                FieldValue::from(reporting.len() as i64),
+            ),
+        ])])
     }
 }

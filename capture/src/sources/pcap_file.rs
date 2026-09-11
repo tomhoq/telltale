@@ -100,7 +100,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use pcap_file::pcap::{PcapPacket, PcapWriter};
-    use pf_core::{Stage, Transport};
+    use pf_core::{TcpHeader, Transport};
 
     fn make_ethernet_ip_tcp(src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut frame = vec![0xff; 12];
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(obs1.source.port, 45678);
         assert_eq!(obs1.destination.port, 80);
         assert_eq!(obs1.transport, Transport::Tcp);
-        assert_eq!(obs1.stage_hint, Some(Stage::Connect));
+        assert_eq!(obs1.tcp.as_ref().map(|t| t.flags), Some(TcpHeader::SYN));
 
         let obs2 = source.next_observation().unwrap().expect("expected packet 2");
         assert_eq!(obs2.at, SystemTime::UNIX_EPOCH + Duration::from_secs(102));
