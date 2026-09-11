@@ -1,4 +1,6 @@
+use std::fmt;
 use std::io;
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use pf_core::{Error, Observation, Result};
@@ -14,7 +16,10 @@ const READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Live capture from a network interface.
 ///
 /// Opening one needs `CAP_NET_RAW` (`setcap cap_net_raw,cap_net_admin+eip` on
-/// the binary, or root). Timestamps come from the clock at the moment the frame
+/// the binary, or root). On Windows it needs Npcap instead, checked on open —
+/// see [`crate::npcap`] — and interface names are Npcap device paths
+/// (`\Device\NPF_{GUID}`); [`interfaces`] lists them with readable
+/// descriptions. Timestamps come from the clock at the moment the frame
 /// is read, not from the kernel's own hardware/software timestamp, so they run
 /// a little late under load; that is fine for idle timeouts and wrong for
 /// anything measuring inter-packet timing, which is why the pcap replay path
@@ -134,30 +139,82 @@ impl Source for LiveSource {
     }
 }
 
-fn find_interface(name: &str) -> Result<NetworkInterface> {
-    let interfaces = datalink::interfaces();
+/// A capture interface, described for a person choosing one. Keeps pnet's own
+/// type inside this crate.
+#[derive(Debug, Clone)]
+pub struct InterfaceInfo {
+    /// What [`LiveSource::open`] takes.
+    pub name: String,
+    /// The adapter's readable name. On Windows it is the only way to tell the
+    /// `\Device\NPF_{GUID}` paths apart; elsewhere it is usually empty.
+    pub description: String,
+    /// Configured addresses, which is often how people recognise "the one on
+    /// the LAN". IPv4 only on Windows, a pnet limitation.
+    pub addresses: Vec<IpAddr>,
+}
 
-    interfaces
-        .iter()
-        .find(|candidate| candidate.name == name)
-        .cloned()
-        .ok_or_else(|| {
-            let available: Vec<&str> = interfaces.iter().map(|i| i.name.as_str()).collect();
-            Error::Capture(format!(
-                "no interface `{name}`; this host has: {}",
-                available.join(", ")
-            ))
-        })
+impl fmt::Display for InterfaceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.description.as_str() {
+            "" => f.write_str(&self.name),
+            description => write!(f, "{} ({description})", self.name),
+        }
+    }
+}
+
+/// Every interface a [`LiveSource`] could open, in the order the OS reports
+/// them.
+pub fn interfaces() -> Result<Vec<InterfaceInfo>> {
+    Ok(datalink_interfaces()?.into_iter().map(info).collect())
+}
+
+fn info(interface: NetworkInterface) -> InterfaceInfo {
+    InterfaceInfo {
+        addresses: interface.ips.iter().map(|network| network.ip()).collect(),
+        name: interface.name,
+        description: interface.description,
+    }
+}
+
+/// The single gate in front of pnet's datalink layer. On Windows every
+/// datalink call — listing included — goes through Npcap's Packet.dll, which
+/// is delay-loaded: pnet crashes rather than errors if it is missing, so check
+/// first.
+fn datalink_interfaces() -> Result<Vec<NetworkInterface>> {
+    #[cfg(windows)]
+    crate::npcap::ensure_available()?;
+
+    Ok(datalink::interfaces())
+}
+
+fn find_interface(name: &str) -> Result<NetworkInterface> {
+    let interfaces = datalink_interfaces()?;
+
+    if let Some(found) = interfaces.iter().find(|candidate| candidate.name == name) {
+        return Ok(found.clone());
+    }
+
+    let available: Vec<String> = interfaces
+        .into_iter()
+        .map(|interface| info(interface).to_string())
+        .collect();
+    Err(Error::Capture(format!(
+        "no interface `{name}`; this host has: {}",
+        available.join(", ")
+    )))
 }
 
 /// Point at the capability rather than the errno — a bare "permission denied"
 /// out of a packet sniffer sends people to `sudo` when a capability is enough.
 fn open_failed(interface: &str, source: io::Error) -> Error {
     if source.kind() == io::ErrorKind::PermissionDenied {
-        return Error::Capture(format!(
-            "cannot capture on `{interface}`: needs CAP_NET_RAW \
-             (`sudo setcap cap_net_raw,cap_net_admin+eip <binary>`) or root"
-        ));
+        #[cfg(windows)]
+        let needs = "Npcap was installed with access restricted to Administrators; \
+                     run from an elevated prompt, or reinstall Npcap without that option";
+        #[cfg(not(windows))]
+        let needs = "needs CAP_NET_RAW \
+                     (`sudo setcap cap_net_raw,cap_net_admin+eip <binary>`) or root";
+        return Error::Capture(format!("cannot capture on `{interface}`: {needs}"));
     }
     Error::Capture(format!("cannot capture on `{interface}`: {source}"))
 }

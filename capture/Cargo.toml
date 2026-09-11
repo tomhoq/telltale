@@ -5,11 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Capture sources and observation decoding for icsyd-pf."
+description = "Capture sources and observation decoding for telltale-pf."
 
 [dependencies]
 pf-core = { workspace = true }
 
 # Capture and packet decoding. `pnet` is pure Rust on Linux (AF_PACKET raw
-# sockets), so there is no libpcap build dependency.
+# sockets), so there is no libpcap build dependency. On Windows it goes through
+# Npcap's Packet.dll; see build.rs and src/npcap.rs.
 pnet = { workspace = true }
+pcap-file = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+] }

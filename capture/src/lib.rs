@@ -5,6 +5,8 @@
 //! which is what makes adding a source an additive change.
 
 pub mod decode;
+#[cfg(windows)]
+pub mod npcap;
 pub mod sources;
 
 pub use sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};

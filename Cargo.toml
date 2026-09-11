@@ -3,7 +3,7 @@ resolver = "2"
 # `dispatch` is not a member yet: it depends on a `pf-methods` crate that does
 # not exist in the tree, so it cannot resolve. Add it here in the same commit
 # that adds `methods`.
-members = ["capture", "core"]
+members = ["capture", "core", "cli", "dispatch", "methods", "output"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,10 @@ authors = ["tomhoq <tomhoq2003@gmail.com>"]
 [workspace.dependencies]
 pf-core = { path = "core" }
 pf-capture = { path = "capture" }
+pf-methods = { path = "methods" }
+pf-dispatch = { path = "dispatch" }
+pf-output = { path = "output" }
+clap = { version = "4", features = ["derive"] }
 
 crossbeam-channel = "0.5"
 pnet = "0.35"
@@ -22,3 +26,6 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
 tracing = "0.1"
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pcap-file = "2.0"

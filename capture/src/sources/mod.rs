@@ -7,6 +7,6 @@ pub mod pcap_file;
 pub mod tcpdump;
 
 pub use honeypot_log::HoneypotLogSource;
-pub use live::LiveSource;
+pub use live::{InterfaceInfo, LiveSource};
 pub use pcap_file::PcapFileSource;
 pub use tcpdump::TcpdumpSource;
