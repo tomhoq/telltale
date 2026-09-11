@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+# `dispatch` is not a member yet: it depends on a `pf-methods` crate that does
+# not exist in the tree, so it cannot resolve. Add it here in the same commit
+# that adds `methods`.
+members = ["capture", "core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+authors = ["tomhoq <tomhoq2003@gmail.com>"]
+
+[workspace.dependencies]
+pf-core = { path = "core" }
+pf-capture = { path = "capture" }
+
+crossbeam-channel = "0.5"
+pnet = "0.35"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = "0.1"

@@ -1,0 +1,15 @@
+[package]
+name = "pf-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Capture sources and observation decoding for icsyd-pf."
+
+[dependencies]
+pf-core = { workspace = true }
+
+# Capture and packet decoding. `pnet` is pure Rust on Linux (AF_PACKET raw
+# sockets), so there is no libpcap build dependency.
+pnet = { workspace = true }
