@@ -24,10 +24,9 @@ impl Method for Ja4 {
     }
 
     fn extract(&self, ctx: &Context<'_>) -> Result<Outcome> {
-        let session = ctx.session;
         // The registry guarantees the session reached `tls-client-hello`, so the
         // hello is somewhere in here.
-        let Some(_hello) = session.from_initiator().find(|o| !o.payload.is_empty()) else {
+        let Some(_hello) = ctx.observations().find(|o| !o.payload.is_empty()) else {
             return Ok(Outcome::NotApplicable);
         };
 

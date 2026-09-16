@@ -93,7 +93,12 @@ impl Registry {
     ///
     /// Evidence accumulates as we go, in priority order, so a fusion method
     /// reads what the methods before it produced.
-    pub fn analyze(&self, session: &Session, final_pass: bool) -> Vec<Evidence> {
+    ///
+    /// `both_directions` is the run's direction policy: false (the default)
+    /// hands every method only the traffic the session's initiator sent — on a
+    /// honeypot that is the attacker, i.e. incoming traffic. true also exposes
+    /// the responder's side via [`Context::observations`].
+    pub fn analyze(&self, session: &Session, final_pass: bool, both_directions: bool) -> Vec<Evidence> {
         let mut evidence: Vec<Evidence> = Vec::new();
 
         for method in &self.methods {
@@ -120,7 +125,7 @@ impl Registry {
             // TODO: enforce invocation.budget_ms here — a runaway method must not
             // stall its worker.
             let outcome = {
-                let ctx = Context::new(session, &evidence, final_pass);
+                let ctx = Context::new(session, &evidence, final_pass, both_directions);
                 match method.extract(&ctx) {
                     Ok(outcome) => outcome,
                     Err(error) => {

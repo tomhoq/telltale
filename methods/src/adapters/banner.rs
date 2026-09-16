@@ -26,9 +26,8 @@ impl Method for Banner {
     }
 
     fn extract(&self, ctx: &Context<'_>) -> Result<Outcome> {
-        let session = ctx.session;
-        let scanned: usize = session
-            .from_initiator()
+        let scanned: usize = ctx
+            .observations()
             .map(|o| o.payload.len())
             .take_while(|len| *len <= self.max_bytes)
             .sum();

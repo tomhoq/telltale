@@ -1,5 +1,6 @@
 use crate::evidence::Evidence;
 use crate::manifest::MethodManifest;
+use crate::observation::Observation;
 use crate::session::Session;
 
 /// What a method is given to work with.
@@ -14,15 +15,42 @@ pub struct Context<'a> {
     pub evidence: &'a [Evidence],
     /// True when the session is closed or timed out and will not grow again.
     pub is_final: bool,
+    /// The pipeline's direction policy: false analyses only what the initiator
+    /// (the attacker, on a honeypot) sent; true also hands methods the
+    /// responder's side. Set once for the whole run — see [`Context::observations`].
+    pub both_directions: bool,
 }
 
 impl<'a> Context<'a> {
-    pub fn new(session: &'a Session, evidence: &'a [Evidence], is_final: bool) -> Self {
+    pub fn new(
+        session: &'a Session,
+        evidence: &'a [Evidence],
+        is_final: bool,
+        both_directions: bool,
+    ) -> Self {
         Self {
             session,
             evidence,
             is_final,
+            both_directions,
         }
+    }
+
+    /// The observations a method should look at, under the run's direction
+    /// policy.
+    ///
+    /// This is the one place that policy is applied. Methods that need "the
+    /// traffic" call this instead of reading `session.observations` or
+    /// `session.from_initiator()` directly, so a run's `--both-directions` flag
+    /// governs every method uniformly rather than each adapter deciding for
+    /// itself.
+    pub fn observations(&self) -> impl Iterator<Item = &Observation> + '_ {
+        let both = self.both_directions;
+        let initiator = self.session.initiator;
+        self.session
+            .observations
+            .iter()
+            .filter(move |o| both || o.source == initiator)
     }
 
     /// Every value a given method claimed for a key.

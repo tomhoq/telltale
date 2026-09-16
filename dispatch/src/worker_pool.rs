@@ -31,10 +31,20 @@ impl Dispatcher {
     /// Results arrive on the returned receiver, unordered — two sessions
     /// finishing on different threads have no defined relative order, so the
     /// consumer must not depend on one.
-    /// 
-    /// Arc defines a thread-safe reference-counting pointer, which allows multiple threads to share ownership of the same data. 
+    ///
+    /// `both_directions` is the run's direction policy, applied uniformly to
+    /// every job: false (the default) analyses only traffic incoming from each
+    /// session's initiator; true also exposes the responder's side. It is fixed
+    /// for the life of the pool rather than per-job, since it is a property of
+    /// the run, not of any one session.
+    ///
+    /// Arc defines a thread-safe reference-counting pointer, which allows multiple threads to share ownership of the same data.
     /// In this case, it is used to share the `Registry` instance among the worker threads.
-    pub fn spawn(registry: Arc<Registry>, workers: usize) -> (Self, Receiver<Vec<Evidence>>) {
+    pub fn spawn(
+        registry: Arc<Registry>,
+        workers: usize,
+        both_directions: bool,
+    ) -> (Self, Receiver<Vec<Evidence>>) {
         // message queue for jobs to be processed by worker threads
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>(); 
         let (result_tx, result_rx) = crossbeam_channel::unbounded::<Vec<Evidence>>();
@@ -49,7 +59,8 @@ impl Dispatcher {
                     .name(format!("pf-worker-{id}"))
                     .spawn(move || {
                         for job in jobs {
-                            let evidence = registry.analyze(&job.session, job.is_final);
+                            let evidence =
+                                registry.analyze(&job.session, job.is_final, both_directions);
                             if results.send(evidence).is_err() {
                                 break; // consumer went away
                             }

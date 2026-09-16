@@ -26,6 +26,15 @@ pub struct PipelineConfig {
     pub workers: usize,
 
     pub output: OutputMode,
+
+    /// Analyse both directions of a session instead of just the traffic
+    /// incoming from its initiator (the attacker, on a honeypot). Off by
+    /// default: passive fingerprinting is about the client hitting the
+    /// honeypot, not the honeypot's own responses, and honeypot logs often
+    /// only capture the incoming side anyway. Overridable per run with
+    /// `--both-directions`.
+    #[serde(default)]
+    pub both_directions: bool,
 }
 
 /// The decision that shapes everything else.
@@ -59,6 +68,7 @@ impl Default for PipelineConfig {
             session_timeout_secs: default_timeout_secs(),
             workers: default_workers(),
             output: OutputMode::PerSession,
+            both_directions: false,
         }
     }
 }

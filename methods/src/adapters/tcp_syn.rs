@@ -38,7 +38,7 @@ impl Method for TcpSyn {
             return Ok(Outcome::NotApplicable);
         }
 
-        let Some(_syn) = session.from_initiator().next() else {
+        let Some(_syn) = ctx.observations().next() else {
             return Ok(Outcome::NotApplicable);
         };
 

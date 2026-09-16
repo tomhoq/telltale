@@ -33,6 +33,12 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = Format::Text, global = true)]
     format: Format,
+
+    /// Analyse both directions of a session instead of just the traffic
+    /// incoming from its initiator. Overrides `both-directions` in the config
+    /// file, if set there.
+    #[arg(long, global = true)]
+    both_directions: bool,
 }
 
 #[derive(Subcommand)]
@@ -80,10 +86,13 @@ fn main() -> pf_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = match &cli.config {
+    let mut config = match &cli.config {
         Some(path) => PipelineConfig::load(path)?,
         None => PipelineConfig::default(),
     };
+    if cli.both_directions {
+        config.both_directions = true;
+    }
     let registry = Registry::load_dir(&config.manifest_dir)?;
 
     if let Command::Methods = cli.command {
@@ -117,7 +126,8 @@ fn run(
     config: &PipelineConfig,
     format: Format,
 ) -> pf_core::Result<()> {
-    let (dispatcher, results) = Dispatcher::spawn(Arc::new(registry), config.workers);
+    let (dispatcher, results) =
+        Dispatcher::spawn(Arc::new(registry), config.workers, config.both_directions);
     let mut assembler = Assembler::new(config.session_timeout());
 
     while let Some(observation) = source.next_observation()? {
