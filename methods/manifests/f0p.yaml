@@ -1,0 +1,39 @@
+name: f0p
+description: >
+  Passive TCP/IP stack fingerprinting (p0f-style: TTL, window, MSS, option
+  order) from the SYN, matched against the real p0f fingerprint database.
+  Refined with HTTP request features — User-Agent and header order — once
+  the session sends one, the same way real p0f matches TCP and HTTP
+  signatures out of one fingerprint file. The name is p0f spelled backwards:
+  same database, our own (simplified) matcher.
+enabled: true
+
+# Satisfied by the very first packet, so this method effectively always runs.
+required-stage: connect
+
+invocation:
+  # Every-observation, not just stage-reached: the SYN alone gives an
+  # OS/stack guess, but a later HTTP request refines it, so this needs a
+  # second look whenever the session grows.
+  trigger: every-observation
+  priority: 100
+  budget-ms: 50
+
+database:
+  path: ../db/p0f.fp
+  format: p0f
+
+output:
+  fields:
+    - name: os
+      description: Operating system family and version, from the TCP/IP stack signature.
+    - name: stack
+      description: TCP/IP stack, when it differs from the OS (raw-socket tools, scanners).
+    - name: distance
+      description: Estimated hop count, from the gap between the observed TTL and its nearest common initial value.
+    - name: client
+      description: HTTP client/tool, from the User-Agent and header order.
+
+params:
+  # Reject signature matches below this similarity.
+  min-score: 0.8

@@ -18,6 +18,6 @@ pub use error::{Error, Result};
 pub use evidence::{Confidence, Evidence};
 pub use manifest::{DatabaseSpec, Invocation, MethodManifest, OutputSchema, Trigger};
 pub use method::{Context, Method, Outcome};
-pub use observation::{Direction, Endpoint, Observation, Transport};
+pub use observation::{Direction, Endpoint, Observation, TcpFeatures, TcpOptionKind, Transport};
 pub use profile::{Profile, ProfileStore, Verdict};
 pub use session::{Session, SessionKey, SessionState, Stage};

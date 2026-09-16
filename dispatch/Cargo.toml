@@ -9,7 +9,6 @@ description = "Session correlation and worker pool dispatch engine for telltale-
 
 [dependencies]
 pf-core = { workspace = true }
-pf-methods = { workspace = true }
 
 crossbeam-channel = { workspace = true }
 tracing = { workspace = true }

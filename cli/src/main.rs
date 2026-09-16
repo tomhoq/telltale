@@ -6,14 +6,15 @@ mod config;
 mod pick;
 
 use std::sync::Arc;
+use std::thread;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use pf_capture::sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};
 use pf_capture::Source;
-use pf_core::Session;
+use pf_core::{Observation, Session};
 use pf_dispatch::{Assembler, Dispatcher, Emitted, Job};
 use pf_methods::Registry;
-use pf_output::{render_json, render_text, BatchConsumer};
+use pf_output::{render_json, render_line, render_text, InferenceConsumer};
 
 use crate::config::{OutputMode, PipelineConfig};
 
@@ -39,6 +40,14 @@ struct Cli {
     /// file, if set there.
     #[arg(long, global = true)]
     both_directions: bool,
+
+    /// Log every observation as it comes off the source — endpoints,
+    /// transport, payload size, and the raw TCP/IP signature fields `f0p`
+    /// matches on, when the source can see them. Shorthand for `RUST_LOG=debug`
+    /// that doesn't require knowing the env var; logs go to stderr, so they
+    /// never mix with `--format json` on stdout.
+    #[arg(long, global = true)]
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -81,11 +90,20 @@ enum Format {
 }
 
 fn main() -> pf_core::Result<()> {
+    let cli = Cli::parse();
+
+    // `--debug` is a shorthand for `RUST_LOG=debug`; either way logs go to
+    // stderr so they never land in `--format json`'s stdout output.
+    let filter = if cli.debug {
+        tracing_subscriber::EnvFilter::new("debug")
+    } else {
+        tracing_subscriber::EnvFilter::from_default_env()
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     let mut config = match &cli.config {
         Some(path) => PipelineConfig::load(path)?,
         None => PipelineConfig::default(),
@@ -126,12 +144,41 @@ fn run(
     config: &PipelineConfig,
     format: Format,
 ) -> pf_core::Result<()> {
-    let (dispatcher, results) =
-        Dispatcher::spawn(Arc::new(registry), config.workers, config.both_directions);
+    // pf-dispatch is generic over "a thing that turns a session into
+    // evidence" — the registry, and the direction policy it needs to apply
+    // that, are pf-methods' concern, so they are closed over here rather than
+    // threaded through the dispatcher's own API.
+    let registry = Arc::new(registry);
+    let both_directions = config.both_directions;
+    let analyze = {
+        let registry = Arc::clone(&registry);
+        move |session: &Session, is_final: bool| registry.analyze(session, is_final, both_directions)
+    };
+    let (dispatcher, results) = Dispatcher::spawn(config.workers, analyze);
     let mut assembler = Assembler::new(config.session_timeout());
+
+    // A session finishes — times out, or the source ends — the moment its
+    // own inactivity window closes, which for `live`/`tcpdump` can be long
+    // before the run itself does; those sources never end on their own at
+    // all. Consuming results here, off a dedicated thread, as they arrive is
+    // what makes that visible: without it nothing prints until the capture
+    // loop below exits, which for those sources never happens, so it would
+    // look like nothing was ever being classified even though the dispatcher
+    // is scoring sessions the whole time.
+    let print_incrementally = matches!(format, Format::Text);
+    let consumer = thread::spawn(move || {
+        InferenceConsumer::consume_streaming(results, |evidence, store| {
+            if print_incrementally {
+                if let Some(profile) = store.get(&evidence.subject) {
+                    println!("{}", render_line(&evidence.subject, profile));
+                }
+            }
+        })
+    });
 
     while let Some(observation) = source.next_observation()? {
         let now = observation.at;
+        log_observation(&observation);
 
         match assembler.ingest(observation) {
             Emitted::Opened(key) | Emitted::Updated(key) => {
@@ -157,20 +204,58 @@ fn run(
         submit(&dispatcher, session, true);
     }
 
-    // Closing the queue lets the workers finish and the result channel close.
+    // Closing the queue lets the workers finish and the result channel close,
+    // which is what lets the consumer thread's `for batch in results` loop
+    // end and hand back the final store.
     dispatcher.shutdown();
+    let store = consumer.join().expect("result consumer thread should not panic");
 
-    // Consume results via pf_output
-    let store = BatchConsumer::consume(results);
-
-    let out = match format {
-        Format::Text => render_text(&store),
-        Format::Json => render_json(&store),
-    };
-    print!("{out}");
+    match format {
+        // Already streamed above, one line per update as it happened; this is
+        // the final tally, grouped and sorted, once the run is actually over.
+        Format::Text => print!("{}", render_text(&store)),
+        Format::Json => print!("{}", render_json(&store)),
+    }
     Ok(())
 }
 
 fn submit(dispatcher: &Dispatcher, session: Session, is_final: bool) {
     dispatcher.submit(Job { session, is_final });
+}
+
+/// One line per observation as it comes off the source, at `--debug`/
+/// `RUST_LOG=debug`. The TCP fields are the exact signal `f0p` matches
+/// against, which is what makes this useful for "why didn't that session
+/// fingerprint the way I expected" rather than just "traffic is flowing".
+fn log_observation(observation: &Observation) {
+    match &observation.tcp {
+        Some(tcp) => tracing::debug!(
+            source = %observation.source.addr,
+            source_port = observation.source.port,
+            destination = %observation.destination.addr,
+            destination_port = observation.destination.port,
+            transport = ?observation.transport,
+            stage_hint = ?observation.stage_hint,
+            payload_len = observation.payload.len(),
+            ttl = tcp.ttl,
+            df = tcp.df,
+            window = tcp.window,
+            mss = ?tcp.mss,
+            window_scale = ?tcp.window_scale,
+            sack_permitted = tcp.sack_permitted,
+            timestamp = tcp.timestamp,
+            options = ?tcp.option_order,
+            "packet received"
+        ),
+        None => tracing::debug!(
+            source = %observation.source.addr,
+            source_port = observation.source.port,
+            destination = %observation.destination.addr,
+            destination_port = observation.destination.port,
+            transport = ?observation.transport,
+            stage_hint = ?observation.stage_hint,
+            payload_len = observation.payload.len(),
+            "packet received"
+        ),
+    }
 }

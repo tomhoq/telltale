@@ -10,7 +10,7 @@ directory) and `database.format`, and its adapter implements
 
 | File               | Format       | Method    | Source |
 | ------------------ | ------------ | --------- | ------ |
-| `p0f.fp`           | `p0f`        | `tcp-syn` | TODO: vendor from p0f, note the licence |
+| `p0f.fp`           | `p0f`        | `f0p`     | Vendored unmodified from the p0f project (LGPL-2.1) — see `p0f.fp.LICENSE` |
 | `ja4-known.jsonl`  | `json-lines` | `ja4`     | TODO |
 | `banners.yaml`     | `rules`      | `banner`  | TODO: hand-written |
 

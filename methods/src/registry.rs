@@ -16,7 +16,7 @@ pub type AdapterFactory = fn(MethodManifest, &Path) -> Result<Box<dyn Method>>;
 /// Every adapter compiled into the binary, keyed by manifest `name`.
 pub fn builtin_adapters() -> HashMap<&'static str, AdapterFactory> {
     HashMap::from([
-        ("tcp-syn", adapters::tcp_syn::build as AdapterFactory),
+        ("f0p", adapters::f0p::build as AdapterFactory),
         ("ja4", adapters::ja4::build as AdapterFactory),
         ("banner", adapters::banner::build as AdapterFactory),
         ("fusion", adapters::fusion::build as AdapterFactory),

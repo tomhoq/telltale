@@ -1,0 +1,22 @@
+p0f.fp is vendored verbatim (byte-for-byte, `diff`-clean) from the p0f
+project and is not modified by this repository. Do not hand-edit it — if a
+signature needs to change, that is a p0f upstream change, not one here.
+
+Upstream:  p0f 3.09b (Debian package `p0f`, file /etc/p0f/p0f.fp)
+Source:    http://lcamtuf.coredump.cx/p0f3/releases/
+Copyright: 2000-2012 Michal Zalewski <lcamtuf@coredump.cx>
+License:   GNU Lesser General Public License, version 2.1 (LGPL-2.1)
+
+This library is free software; you can redistribute it and/or modify it
+under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation; either version 2.1 of the License, or (at
+your option) any later version.
+
+This library is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser
+General Public License for more details.
+
+The full license text is available at
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html, and on any
+Debian-derived system at /usr/share/common-licenses/LGPL-2.1.

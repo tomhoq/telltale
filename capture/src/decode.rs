@@ -14,13 +14,14 @@
 use std::net::IpAddr;
 use std::time::SystemTime;
 
-use pf_core::{Endpoint, Observation, Stage, Transport};
+use pf_core::{Endpoint, Observation, Stage, TcpFeatures, TcpOptionKind, Transport};
 use pnet::packet::ethernet::{EtherType, EtherTypes, EthernetPacket};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
-use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::{TcpFlags, TcpPacket};
+use pnet::packet::tcp::{TcpFlags, TcpOptionNumbers, TcpPacket};
 use pnet::packet::udp::UdpPacket;
+use pnet::packet::Packet;
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const VLAN_TAG_LEN: usize = 4;
@@ -95,12 +96,17 @@ fn ipv4(packet: &[u8], at: SystemTime) -> Option<Observation> {
         return None;
     }
 
+    let ttl = ip.get_ttl();
+    let df = ip.get_flags() & Ipv4Flags::DontFragment != 0;
+
     transport(
         ip.get_next_level_protocol(),
         IpAddr::V4(ip.get_source()),
         IpAddr::V4(ip.get_destination()),
         &packet[header_len..end],
         at,
+        ttl,
+        df,
     )
 }
 
@@ -119,6 +125,10 @@ fn ipv6(packet: &[u8], at: SystemTime) -> Option<Observation> {
         IpAddr::V6(ip.get_destination()),
         &packet[IPV6_HEADER_LEN..end],
         at,
+        ip.get_hop_limit(),
+        // No fragment extension header seen (we don't walk the chain yet), so
+        // nothing says this datagram may be fragmented.
+        true,
     )
 }
 
@@ -128,20 +138,23 @@ fn transport(
     destination: IpAddr,
     segment: &[u8],
     at: SystemTime,
+    ttl: u8,
+    df: bool,
 ) -> Option<Observation> {
-    let (transport, source_port, destination_port, payload, stage_hint) = match protocol {
+    let (transport, source_port, destination_port, payload, stage_hint, tcp) = match protocol {
         IpNextHeaderProtocols::Tcp => {
-            let tcp = TcpPacket::new(segment)?;
-            let header_len = tcp.get_data_offset() as usize * 4;
+            let tcp_packet = TcpPacket::new(segment)?;
+            let header_len = tcp_packet.get_data_offset() as usize * 4;
             if !(TCP_MIN_HEADER_LEN..=segment.len()).contains(&header_len) {
                 return None;
             }
             (
                 Transport::Tcp,
-                tcp.get_source(),
-                tcp.get_destination(),
+                tcp_packet.get_source(),
+                tcp_packet.get_destination(),
                 &segment[header_len..],
-                tcp_stage(tcp.get_flags()),
+                tcp_stage(tcp_packet.get_flags()),
+                Some(tcp_features(&tcp_packet, ttl, df)),
             )
         }
         IpNextHeaderProtocols::Udp => {
@@ -153,11 +166,12 @@ fn transport(
                 udp.get_destination(),
                 &segment[UDP_HEADER_LEN..end],
                 None,
+                None,
             )
         }
         // ICMP, ESP, GRE and friends: no ports to report, but the flow is still
         // worth correlating, so it is kept with the raw bytes intact.
-        other => (Transport::Other(other.0), 0, 0, segment, None),
+        other => (Transport::Other(other.0), 0, 0, segment, None, None),
     };
 
     Some(Observation {
@@ -173,7 +187,64 @@ fn transport(
         transport,
         payload: payload.to_vec(),
         stage_hint,
+        tcp,
     })
+}
+
+/// Every TCP/IP stack characteristic a passive fingerprinting method might
+/// want off one segment: the IP-layer TTL/DF the caller already parsed, plus
+/// the TCP window and options as they arrived on the wire — order, padding
+/// and all, since which options a stack sends and in what order is as
+/// diagnostic as their values. Which of this is actually diagnostic is a
+/// method's call, not this crate's; it is carried on [`Observation`] as-is.
+fn tcp_features(tcp: &TcpPacket, ttl: u8, df: bool) -> TcpFeatures {
+    let mut mss = None;
+    let mut window_scale = None;
+    let mut sack_permitted = false;
+    let mut timestamp = false;
+    let mut option_order = Vec::new();
+
+    for option in tcp.get_options_iter() {
+        let data = option.payload();
+        let kind = match option.get_number() {
+            TcpOptionNumbers::EOL => TcpOptionKind::Eol,
+            TcpOptionNumbers::NOP => TcpOptionKind::Nop,
+            TcpOptionNumbers::MSS => {
+                if let [a, b] = *data {
+                    mss = Some(u16::from_be_bytes([a, b]));
+                }
+                TcpOptionKind::Mss
+            }
+            TcpOptionNumbers::WSCALE => {
+                if let [shift] = *data {
+                    window_scale = Some(shift);
+                }
+                TcpOptionKind::WindowScale
+            }
+            TcpOptionNumbers::SACK_PERMITTED => {
+                sack_permitted = true;
+                TcpOptionKind::SackPermitted
+            }
+            TcpOptionNumbers::SACK => TcpOptionKind::Sack,
+            TcpOptionNumbers::TIMESTAMPS => {
+                timestamp = true;
+                TcpOptionKind::Timestamp
+            }
+            other => TcpOptionKind::Other(other.0),
+        };
+        option_order.push(kind);
+    }
+
+    TcpFeatures {
+        ttl,
+        df,
+        window: tcp.get_window(),
+        mss,
+        window_scale,
+        sack_permitted,
+        timestamp,
+        option_order,
+    }
 }
 
 /// What the TCP flags establish on their own, and no more.
@@ -243,6 +314,36 @@ mod tests {
         datagram
     }
 
+    /// Like `tcp`, but with a raw options block — padded to a 4-byte boundary
+    /// with NOPs, same as a real stack would — so `tcp_features` has something
+    /// to parse.
+    fn tcp_with_options(
+        source: u16,
+        destination: u16,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut padded = options.to_vec();
+        while padded.len() % 4 != 0 {
+            padded.push(0x01); // NOP
+        }
+        let data_offset_words = ((TCP_MIN_HEADER_LEN + padded.len()) / 4) as u8;
+
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&source.to_be_bytes());
+        segment.extend_from_slice(&destination.to_be_bytes());
+        segment.extend_from_slice(&[0; 8]); // seq + ack
+        segment.push(data_offset_words << 4);
+        segment.push(flags);
+        segment.extend_from_slice(&0x7120u16.to_be_bytes()); // window
+        segment.extend_from_slice(&[0, 0]); // checksum
+        segment.extend_from_slice(&[0, 0]); // urgent
+        segment.extend_from_slice(&padded);
+        segment.extend_from_slice(payload);
+        segment
+    }
+
     #[test]
     fn decodes_a_tcp_syn() {
         let frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpFlags::SYN, &[])));
@@ -298,6 +399,50 @@ mod tests {
         let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
         assert_eq!(observation.transport, Transport::Udp);
         assert_eq!(observation.payload, b"query");
+    }
+
+    #[test]
+    fn tcp_features_captures_ttl_window_and_options_in_order() {
+        // mss=1460, sack-permitted, timestamp(1,0), nop, wscale=7 — a plausible
+        // Linux-style SYN option layout, already a multiple of 4 bytes.
+        let options = [
+            2, 4, 0x05, 0xB4, // MSS
+            4, 2, // SACK permitted
+            8, 10, 0, 0, 0, 1, 0, 0, 0, 0, // timestamp
+            1, // NOP
+            3, 3, 7, // window scale
+        ];
+        let frame = ethernet(
+            0x0800,
+            &ipv4(6, &tcp_with_options(51234, 22, TcpFlags::SYN, &options, &[])),
+        );
+        let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
+
+        let tcp = observation.tcp.expect("a TCP segment should carry features");
+        assert_eq!(tcp.ttl, 64);
+        assert!(tcp.df);
+        assert_eq!(tcp.window, 0x7120);
+        assert_eq!(tcp.mss, Some(1460));
+        assert_eq!(tcp.window_scale, Some(7));
+        assert!(tcp.sack_permitted);
+        assert!(tcp.timestamp);
+        assert_eq!(
+            tcp.option_order,
+            vec![
+                TcpOptionKind::Mss,
+                TcpOptionKind::SackPermitted,
+                TcpOptionKind::Timestamp,
+                TcpOptionKind::Nop,
+                TcpOptionKind::WindowScale,
+            ]
+        );
+    }
+
+    #[test]
+    fn non_tcp_transports_carry_no_tcp_features() {
+        let frame = ethernet(0x0800, &ipv4(17, &udp(51234, 53, b"query")));
+        let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
+        assert!(observation.tcp.is_none());
     }
 
     #[test]
