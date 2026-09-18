@@ -58,6 +58,9 @@ pub struct TcpSignature {
     /// Display name built from the label's `name` and `flavor`, e.g. "Linux
     /// 3.11 and newer" or "NMap SYN scan".
     pub label: String,
+    /// The `sig = ...` value exactly as written in the database, for showing
+    /// which entry matched next to the observed signature.
+    pub raw: String,
     pub ip_version: Option<u8>,
     pub initial_ttl: u8,
     /// Trailing `-` on `ittl`: some userspace tools randomize TTL below a
@@ -68,6 +71,10 @@ pub struct TcpSignature {
     pub window: WindowSpec,
     pub window_scale: Option<u8>,
     pub option_layout: Vec<TcpOptionKind>,
+    /// The `N` of a trailing `eol+N`: padding bytes after the EOL option.
+    /// `None` when the layout has no EOL. Same shape as
+    /// `TcpFeatures::eol_padding`, so the two compare directly.
+    pub eol_padding: Option<u8>,
     /// Raw quirk tokens (`df`, `id+`, `ecn`, `ack+`, ...), kept verbatim.
     /// `f0p`'s matcher currently only checks `df`, because that is the only
     /// one `pf_core::TcpFeatures` observes yet — the ID/ECN/sequence/ack/urg
@@ -245,6 +252,12 @@ fn parse_tcp_sig(value: &str, current: &PendingLabel) -> Option<TcpSignature> {
         .filter(|t| !t.is_empty())
         .map(parse_option_token)
         .collect();
+    // p0f's `eol+N`: EOL, then N bytes of padding. `eol` alone would be no
+    // padding, though p0f always writes the count.
+    let eol_padding = olayout
+        .split(',')
+        .find_map(|t| t.strip_prefix("eol"))
+        .map(|rest| rest.strip_prefix('+').and_then(|n| n.parse().ok()).unwrap_or(0));
 
     let quirks = quirks
         .split(',')
@@ -262,6 +275,7 @@ fn parse_tcp_sig(value: &str, current: &PendingLabel) -> Option<TcpSignature> {
         specific: current.specific,
         class: current.class.clone(),
         label: current.label.clone(),
+        raw: value.trim().to_string(),
         ip_version,
         initial_ttl,
         ittl_is_ceiling,
@@ -269,6 +283,7 @@ fn parse_tcp_sig(value: &str, current: &PendingLabel) -> Option<TcpSignature> {
         window,
         window_scale,
         option_layout,
+        eol_padding,
         quirks,
         payload_class,
     })
@@ -425,8 +440,23 @@ sig   = *:64:0:*:mss*20,10:mss,sok,ts,nop,ws:df,id+:0
                 TcpOptionKind::WindowScale,
             ]
         );
+        assert_eq!(sig.eol_padding, None);
         assert_eq!(sig.quirks, vec!["df", "id+"]);
         assert_eq!(sig.payload_class, PayloadClass::Zero);
+    }
+
+    #[test]
+    fn eol_padding_is_parsed_into_its_own_count() {
+        let text = "\
+[tcp:request]
+
+label = g:unix:Mac OS X:
+sig   = *:64:0:*:65535,*:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0
+";
+        let sig = &parse(text).tcp_request[0];
+        assert_eq!(sig.option_layout.last(), Some(&TcpOptionKind::Eol));
+        assert_eq!(sig.option_layout.len(), 8);
+        assert_eq!(sig.eol_padding, Some(1));
     }
 
     #[test]

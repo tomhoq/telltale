@@ -49,8 +49,14 @@ pub struct TcpFeatures {
     pub sack_permitted: bool,
     pub timestamp: bool,
     /// Option kinds in wire order, including repeats and padding NOPs — the
-    /// order and padding are as diagnostic as which options are present.
+    /// order and padding are as diagnostic as which options are present. Ends
+    /// at the EOL option, if there is one: what follows it is padding, not
+    /// options, and is counted in `eol_padding` instead.
     pub option_order: Vec<TcpOptionKind>,
+    /// Bytes after the EOL option that fill the options area out to its
+    /// 4-byte boundary — p0f's `eol+N`. `None` when no EOL was sent.
+    #[serde(default)]
+    pub eol_padding: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

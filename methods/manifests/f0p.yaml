@@ -29,6 +29,8 @@ output:
       description: Operating system family and version, from the TCP/IP stack signature.
     - name: stack
       description: TCP/IP stack, when it differs from the OS (raw-socket tools, scanners).
+    - name: signature
+      description: The observed SYN in p0f's raw_sig notation (ver:ittl:olen:mss:wsize,scale:olayout:quirks:pclass), for comparing against p0f and its database.
     - name: distance
       description: Estimated hop count, from the gap between the observed TTL and its nearest common initial value.
     - name: client

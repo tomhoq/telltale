@@ -107,9 +107,12 @@ fn score_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &
 
     // Always checked, including an empty layout: "no options at all" is
     // itself a real, diagnostic signature (several old or minimal stacks use
-    // it), not a wildcard.
+    // it), not a wildcard. The padding after an EOL is part of the layout:
+    // `eol+1` and `eol+3` are different stacks.
     checks += 1.0;
-    matches += (observed.option_order == sig.option_layout) as u8 as f64;
+    let layout_ok =
+        observed.option_order == sig.option_layout && observed.eol_padding == sig.eol_padding;
+    matches += layout_ok as u8 as f64;
 
     // Only `df` is currently observed among p0f's quirks — see
     // `TcpSignature::quirks`.
@@ -131,6 +134,68 @@ fn score_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &
     }
 
     matches / checks
+}
+
+/// The observed SYN written the way p0f prints its own `raw_sig`
+/// (`ver:ittl:olen:mss:wsize,scale:olayout:quirks:pclass`), so it can be
+/// compared field by field with p0f's output and with database entries.
+///
+/// Not byte-identical to p0f everywhere, because `TcpFeatures` does not carry
+/// everything p0f looks at: IP option length is not observed and prints `?`,
+/// and `df` is the only quirk captured, so p0f's `id+`, `ecn`, `ts1-`, ...
+/// never appear. The TTL is shown as p0f does, `<initial guess>+<distance>`,
+/// and so is a window that is a whole number of segments, `mss*<n>`.
+fn raw_signature(observed: &TcpFeatures, payload_empty: bool, ip_version: u8) -> String {
+    let initial = nearest_initial_ttl(observed.ttl);
+    let mss = observed.mss.map_or("*".to_string(), |mss| mss.to_string());
+    let window = match observed.mss {
+        Some(mss) if mss > 0 && observed.window % mss == 0 => {
+            format!("mss*{}", observed.window / mss)
+        }
+        _ => observed.window.to_string(),
+    };
+    let quirks = if observed.df { "df" } else { "" };
+    let pclass = if payload_empty { "0" } else { "+" };
+    format!(
+        "{ip_version}:{initial}+{}:?:{mss}:{window},{}:{}:{quirks}:{pclass}",
+        initial - observed.ttl,
+        observed.window_scale.unwrap_or(0),
+        option_layout_text(&observed.option_order, observed.eol_padding),
+    )
+}
+
+/// p0f's `olayout` syntax, where the EOL option carries its padding count:
+/// `eol+<bytes>`.
+fn option_layout_text(options: &[TcpOptionKind], eol_padding: Option<u8>) -> String {
+    let mut tokens = Vec::new();
+    for option in options {
+        let token = match option {
+            TcpOptionKind::Eol => format!("eol+{}", eol_padding.unwrap_or(0)),
+            TcpOptionKind::Nop => "nop".to_string(),
+            TcpOptionKind::Mss => "mss".to_string(),
+            TcpOptionKind::WindowScale => "ws".to_string(),
+            TcpOptionKind::SackPermitted => "sok".to_string(),
+            TcpOptionKind::Sack => "sack".to_string(),
+            TcpOptionKind::Timestamp => "ts".to_string(),
+            TcpOptionKind::Other(kind) => format!("?{kind}"),
+        };
+        tokens.push(token);
+    }
+    tokens.join(",")
+}
+
+/// The highest-scoring signature regardless of `min-score`, for showing what
+/// the matcher came closest to when nothing (or something surprising) matched.
+fn nearest_tcp_signature<'a>(
+    signatures: &'a [TcpSignature],
+    observed: &TcpFeatures,
+    payload_empty: bool,
+    ip_version: u8,
+) -> Option<(&'a TcpSignature, f64)> {
+    signatures
+        .iter()
+        .map(|sig| (sig, score_tcp(observed, payload_empty, ip_version, sig)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 /// Best match, preferring a specific (`s`) signature over a generic (`g`)
@@ -367,6 +432,38 @@ impl Method for F0p {
 
         let mut evidence = Vec::new();
 
+        // The fingerprint itself, in p0f's own notation, so a result can be
+        // checked against p0f's output or the database by eye.
+        let observed_sig = raw_signature(syn, payload_empty, ip_version);
+        match best_tcp {
+            Some((sig, score)) => tracing::debug!(
+                subject = ?ctx.session.initiator,
+                observed = %observed_sig,
+                matched = %sig.label,
+                matched_sig = %sig.raw,
+                score,
+                "f0p tcp match"
+            ),
+            None => {
+                let nearest = nearest_tcp_signature(&self.db.tcp_request, syn, payload_empty, ip_version);
+                tracing::debug!(
+                    subject = ?ctx.session.initiator,
+                    observed = %observed_sig,
+                    nearest = nearest.map(|(sig, _)| sig.label.as_str()),
+                    nearest_sig = nearest.map(|(sig, _)| sig.raw.as_str()),
+                    nearest_score = nearest.map(|(_, score)| score),
+                    "f0p tcp: no signature above min-score"
+                )
+            }
+        }
+        evidence.push(Evidence::new(
+            self.name(),
+            ctx.session.initiator,
+            "signature",
+            observed_sig,
+            Confidence::Weak,
+        ));
+
         // The hop-count estimate needs no signature match at all — it falls
         // out of the observed TTL either way. A match gives the sender's
         // actual intended initial TTL, which is more precise than the
@@ -445,7 +542,29 @@ mod tests {
                 TcpOptionKind::Nop,
                 TcpOptionKind::WindowScale,
             ],
+            eol_padding: None,
         }
+    }
+
+    /// A real iPhone SYN, captured live:
+    /// `4:64+0:?:1460:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df:0`.
+    fn iphone_syn() -> TcpFeatures {
+        use TcpOptionKind::*;
+        TcpFeatures {
+            ttl: 64,
+            df: true,
+            window: 65535,
+            mss: Some(1460),
+            window_scale: Some(6),
+            sack_permitted: true,
+            timestamp: true,
+            option_order: vec![Mss, Nop, WindowScale, Nop, Nop, Timestamp, SackPermitted, Eol],
+            eol_padding: Some(1),
+        }
+    }
+
+    fn vendored_db() -> P0fDb {
+        format::parse(include_str!("../../../db/p0f.fp"))
     }
 
     fn linux_signature() -> TcpSignature {
@@ -456,6 +575,70 @@ mod tests {
         )
         .tcp_request
         .remove(0)
+    }
+
+    #[test]
+    fn the_observed_syn_renders_in_p0f_raw_sig_notation() {
+        let mut observed = linux_syn();
+        observed.ttl = 61;
+        assert_eq!(
+            raw_signature(&observed, true, 4),
+            "4:64+3:?:1460:mss*20,7:mss,sok,ts,nop,ws:df:0"
+        );
+    }
+
+    #[test]
+    fn eol_padding_renders_as_a_byte_count() {
+        assert_eq!(
+            raw_signature(&iphone_syn(), true, 4),
+            "4:64+0:?:1460:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df:0"
+        );
+    }
+
+    /// The bug this guards: the observed layout ended `eol,eol` while the
+    /// database's `eol+1` parsed to a single `eol`, so no Apple signature
+    /// could ever pass the layout check.
+    #[test]
+    fn an_apple_syn_passes_the_layout_check_of_the_apple_signatures() {
+        let db = vendored_db();
+        let generic_mac = db
+            .tcp_request
+            .iter()
+            .find(|sig| !sig.specific && sig.label.starts_with("Mac OS X"))
+            .expect("the vendored db has a generic Mac OS X entry");
+        assert_eq!(score_tcp(&iphone_syn(), true, 4, generic_mac), 1.0);
+    }
+
+    /// Only guards against the old answer. Which Apple entry wins is still
+    /// decided by a tie among near-misses (every specific Apple signature has
+    /// the wrong window scale for this phone), so it is not asserted here.
+    #[test]
+    fn an_iphone_is_no_longer_taken_for_freebsd() {
+        let db = vendored_db();
+        let (sig, _) = best_tcp_match(&db.tcp_request, &iphone_syn(), true, 4, 0.8)
+            .expect("an Apple signature should match");
+        assert!(!sig.label.starts_with("FreeBSD"), "matched {}", sig.label);
+    }
+
+    #[test]
+    fn a_window_that_is_a_whole_number_of_segments_renders_as_mss_multiple() {
+        let mut observed = linux_syn();
+        observed.mss = Some(1440);
+        observed.window = 1440 * 45;
+        assert!(raw_signature(&observed, true, 4).contains(":1440:mss*45,7:"));
+    }
+
+    #[test]
+    fn a_different_padding_length_is_a_different_layout() {
+        let db = vendored_db();
+        let generic_mac = db
+            .tcp_request
+            .iter()
+            .find(|sig| !sig.specific && sig.label.starts_with("Mac OS X"))
+            .unwrap();
+        let mut observed = iphone_syn();
+        observed.eol_padding = Some(3);
+        assert!(score_tcp(&observed, true, 4, generic_mac) < 1.0);
     }
 
     #[test]

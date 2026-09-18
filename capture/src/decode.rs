@@ -203,6 +203,10 @@ fn tcp_features(tcp: &TcpPacket, ttl: u8, df: bool) -> TcpFeatures {
     let mut sack_permitted = false;
     let mut timestamp = false;
     let mut option_order = Vec::new();
+    let mut eol_padding = None;
+    // Bytes of the options area walked so far, to know how much is left once
+    // an EOL ends the list.
+    let mut consumed = 0usize;
 
     for option in tcp.get_options_iter() {
         let data = option.payload();
@@ -233,6 +237,20 @@ fn tcp_features(tcp: &TcpPacket, ttl: u8, df: bool) -> TcpFeatures {
             other => TcpOptionKind::Other(other.0),
         };
         option_order.push(kind);
+
+        // EOL and NOP are a single kind byte; every other option is kind,
+        // length, then data.
+        consumed += match kind {
+            TcpOptionKind::Eol | TcpOptionKind::Nop => 1,
+            _ => 2 + data.len(),
+        };
+        // Whatever follows EOL pads the header out to its 4-byte boundary. It
+        // is not more options, so it is counted rather than decoded.
+        if kind == TcpOptionKind::Eol {
+            let padding = tcp.get_options_raw().len().saturating_sub(consumed);
+            eol_padding = Some(padding as u8);
+            break;
+        }
     }
 
     TcpFeatures {
@@ -244,6 +262,7 @@ fn tcp_features(tcp: &TcpPacket, ttl: u8, df: bool) -> TcpFeatures {
         sack_permitted,
         timestamp,
         option_order,
+        eol_padding,
     }
 }
 
@@ -399,6 +418,73 @@ mod tests {
         let observation = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap();
         assert_eq!(observation.transport, Transport::Udp);
         assert_eq!(observation.payload, b"query");
+    }
+
+    /// Apple stacks end their options with EOL and a padding byte (p0f's
+    /// `eol+1`). The padding is counted, not reported as more EOL options.
+    #[test]
+    fn padding_after_eol_is_counted_not_listed() {
+        let options = [
+            2, 4, 0x05, 0xB4, // MSS
+            1, // NOP
+            3, 3, 6, // window scale
+            1, 1, // NOP NOP
+            8, 10, 0, 0, 0, 1, 0, 0, 0, 0, // timestamp
+            4, 2, // SACK permitted
+            0, // EOL
+            0, // padding
+        ];
+        let frame = ethernet(
+            0x0800,
+            &ipv4(6, &tcp_with_options(51234, 443, TcpFlags::SYN, &options, &[])),
+        );
+        let tcp = ethernet_frame(&frame, SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .tcp
+            .expect("a TCP segment should carry features");
+
+        use TcpOptionKind::*;
+        assert_eq!(
+            tcp.option_order,
+            vec![Mss, Nop, WindowScale, Nop, Nop, Timestamp, SackPermitted, Eol]
+        );
+        assert_eq!(tcp.eol_padding, Some(1));
+    }
+
+    /// Three bytes of padding, and non-zero ones: still padding, not options.
+    #[test]
+    fn everything_after_eol_is_padding_whatever_its_value() {
+        let options = [
+            2, 4, 0x05, 0xB4, // MSS
+            0, // EOL
+            8, 10, 0, // would parse as a truncated timestamp if walked
+        ];
+        let frame = ethernet(
+            0x0800,
+            &ipv4(6, &tcp_with_options(51234, 443, TcpFlags::SYN, &options, &[])),
+        );
+        let tcp = ethernet_frame(&frame, SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .tcp
+            .expect("a TCP segment should carry features");
+
+        assert_eq!(tcp.option_order, vec![TcpOptionKind::Mss, TcpOptionKind::Eol]);
+        assert_eq!(tcp.eol_padding, Some(3));
+    }
+
+    #[test]
+    fn no_eol_means_no_padding() {
+        let options = [2, 4, 0x05, 0xB4]; // MSS alone, already 4 bytes
+        let frame = ethernet(
+            0x0800,
+            &ipv4(6, &tcp_with_options(51234, 443, TcpFlags::SYN, &options, &[])),
+        );
+        let tcp = ethernet_frame(&frame, SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .tcp
+            .expect("a TCP segment should carry features");
+
+        assert_eq!(tcp.eol_padding, None);
     }
 
     #[test]
