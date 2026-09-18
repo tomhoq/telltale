@@ -2,7 +2,7 @@ name: ja4
 description: >
   TLS ClientHello fingerprinting. A strong scanner signal: mass scanners use a
   small set of TLS stacks and their hashes are well catalogued.
-enabled: true
+enabled: false
 
 required-stage: tls-client-hello
 

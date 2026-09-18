@@ -2,7 +2,7 @@ name: fusion
 description: >
   Combines multi-layer evidence from other methods to consolidate intruder
   characteristics (OS, client stack) and infer an overall classification or verdict.
-enabled: true
+enabled: false
 
 # Runs on whatever exists, however little.
 required-stage: connect
