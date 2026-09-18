@@ -11,4 +11,6 @@ description = "Manifest-driven fingerprinting methods for telltale-pf."
 pf-core = { workspace = true }
 
 crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 tracing = { workspace = true }

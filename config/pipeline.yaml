@@ -12,7 +12,7 @@ workers: 8
 
 # per-session    -> assemble the full session, then score once
 # inference-time -> emit a best guess as data arrives, refine as more comes in
-output: per-session
+output: inference-time
 
 # Off by default: methods only see traffic incoming from the session's
 # initiator (the attacker, on a honeypot), not the honeypot's own responses.

@@ -12,7 +12,7 @@ directory) and `database.format`, and its adapter implements
 | ------------------ | ------------ | --------- | ------ |
 | `p0f.fp`           | `p0f`        | `f0p`     | Vendored unmodified from the p0f project (LGPL-2.1) — see `p0f.fp.LICENSE` |
 | `ja4-known.jsonl`  | `json-lines` | `ja4`     | TODO |
-| `banners.yaml`     | `rules`      | `banner`  | TODO: hand-written |
+| `banners.yaml`     | `rules`      | `banner`  | Hand-written: HTTP libraries, named scanners, research crawlers |
 
 `fusion` has no file here on purpose — its combination logic lives in its
 manifest's `params`.

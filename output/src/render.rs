@@ -56,11 +56,20 @@ pub fn render_json(store: &ProfileStore) -> String {
 
 /// One line per profile, for tailing a live run.
 pub fn render_line(endpoint: &pf_core::Endpoint, profile: &Profile) -> String {
+    let mut attributes: Vec<_> = profile.attributes.iter().collect();
+    attributes.sort_by_key(|(key, _)| key.as_str());
+    let attrs: String = attributes
+        .iter()
+        .map(|(key, attribute)| format!("{key}={}", attribute.value))
+        .collect::<Vec<_>>()
+        .join(" ");
+
     format!(
-        "{}:{} {} ({} attrs, {} evidence)",
+        "{}:{} {} {}({} attrs, {} evidence)",
         endpoint.addr,
         endpoint.port,
         verdict_label(profile.verdict),
+        if attrs.is_empty() { String::new() } else { format!("{attrs} ") },
         profile.attributes.len(),
         profile.evidence.len()
     )

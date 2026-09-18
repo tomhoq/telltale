@@ -1,0 +1,146 @@
+# banner signature database — HTTP User-Agent identification.
+#
+# A rule fires when the observed User-Agent matches ANY of its `exact` /
+# `prefix` / `contains` patterns (case-insensitive). `prefix` is also the
+# only kind the adapter extracts a version number after (`curl/8.4.0` ->
+# "8.4.0"), since it's the only one with an unambiguous anchor point.
+#
+# `category` is deliberately coarse — library | scanner | crawler |
+# malformed — enough for `fusion` to weigh later without this file
+# pretending to know every possible taxonomy. Whether a given category is
+# *suspicious in context* (e.g. a bare HTTP library hitting a page a real
+# browser would render) is fusion's call, not this file's: banner only
+# identifies what sent the request, it doesn't judge it.
+
+rules:
+  # ---------------------------------------------------------------
+  # Malformed / no honest disclosure — checked first since these are
+  # exact matches, not general classification calls.
+  # ---------------------------------------------------------------
+  - client: "(no user-agent)"
+    category: malformed
+    exact: ["", "-"]
+
+  - client: "(bare Mozilla/5.0)"
+    category: malformed
+    exact: ["mozilla/5.0"]
+
+  # ---------------------------------------------------------------
+  # HTTP libraries — the common, rarely-spoofed case for low-effort
+  # scripts and automated tools that never bothered to set a custom UA.
+  # ---------------------------------------------------------------
+  - client: curl
+    category: library
+    prefix: ["curl/"]
+
+  - client: Wget
+    category: library
+    prefix: ["wget/"]
+
+  - client: python-requests
+    category: library
+    prefix: ["python-requests/"]
+
+  - client: python-urllib
+    category: library
+    prefix: ["python-urllib/"]
+
+  - client: Go-http-client
+    category: library
+    prefix: ["go-http-client/"]
+
+  - client: okhttp
+    category: library
+    prefix: ["okhttp/"]
+
+  - client: axios
+    category: library
+    prefix: ["axios/"]
+
+  - client: node-fetch
+    category: library
+    prefix: ["node-fetch"]
+
+  - client: libwww-perl
+    category: library
+    prefix: ["libwww-perl/"]
+
+  - client: Java
+    category: library
+    prefix: ["java/"]
+
+  - client: Apache-HttpClient
+    category: library
+    prefix: ["apache-httpclient/"]
+
+  # ---------------------------------------------------------------
+  # Named scanners / security tools.
+  # ---------------------------------------------------------------
+  - client: Nmap
+    category: scanner
+    contains: ["nmap scripting engine"]
+
+  - client: sqlmap
+    category: scanner
+    prefix: ["sqlmap/"]
+
+  - client: Nikto
+    category: scanner
+    contains: ["nikto"]
+
+  - client: masscan
+    category: scanner
+    contains: ["masscan"]
+
+  - client: zgrab
+    category: scanner
+    contains: ["zgrab"]
+
+  - client: Wappalyzer
+    category: scanner
+    contains: ["wappalyzer"]
+
+  - client: Nuclei
+    category: scanner
+    contains: ["nuclei"]
+
+  - client: WPScan
+    category: scanner
+    contains: ["wpscan"]
+
+  - client: dirbuster
+    category: scanner
+    contains: ["dirbuster"]
+
+  - client: gobuster
+    category: scanner
+    contains: ["gobuster"]
+
+  - client: Burp Suite
+    category: scanner
+    contains: ["portswigger", "burp suite"]
+
+  - client: OWASP ZAP
+    category: scanner
+    contains: ["zaproxy", "owasp zap"]
+
+  # ---------------------------------------------------------------
+  # Mass-scan / internet-measurement research crawlers — common honeypot
+  # background noise rather than a targeted attack, but worth telling
+  # apart from one.
+  # ---------------------------------------------------------------
+  - client: CensysInspect
+    category: crawler
+    contains: ["censysinspect"]
+
+  - client: InternetMeasurement
+    category: crawler
+    contains: ["internetmeasurement"]
+
+  - client: Expanse
+    category: crawler
+    contains: ["expanse, a palo alto networks company", "expanse"]
+
+  - client: Shodan
+    category: crawler
+    contains: ["shodan"]

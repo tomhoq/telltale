@@ -5,13 +5,14 @@
 mod config;
 mod pick;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use pf_capture::sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};
 use pf_capture::Source;
-use pf_core::{Observation, Session};
+use pf_core::{Endpoint, Observation, Session};
 use pf_dispatch::{Assembler, Dispatcher, Emitted, Job};
 use pf_methods::Registry;
 use pf_output::{render_json, render_line, render_text, InferenceConsumer};
@@ -40,6 +41,24 @@ struct Cli {
     /// file, if set there.
     #[arg(long, global = true)]
     both_directions: bool,
+
+    /// Directory of method manifests. Overrides `manifest-dir` in the config
+    /// file, if set there.
+    #[arg(long, global = true)]
+    manifest_dir: Option<String>,
+
+    /// Inactivity timeout for session assembly, in seconds. Overrides
+    /// `session-timeout-secs` in the config file, if set there.
+    #[arg(long, global = true)]
+    session_timeout_secs: Option<u64>,
+
+    /// Worker threads. Overrides `workers` in the config file, if set there.
+    #[arg(long, global = true)]
+    workers: Option<usize>,
+
+    /// Overrides `output` in the config file, if set there.
+    #[arg(long, value_enum, global = true)]
+    output: Option<OutputMode>,
 
     /// Log every observation as it comes off the source — endpoints,
     /// transport, payload size, and the raw TCP/IP signature fields `f0p`
@@ -111,6 +130,18 @@ fn main() -> pf_core::Result<()> {
     if cli.both_directions {
         config.both_directions = true;
     }
+    if let Some(manifest_dir) = cli.manifest_dir {
+        config.manifest_dir = manifest_dir;
+    }
+    if let Some(session_timeout_secs) = cli.session_timeout_secs {
+        config.session_timeout_secs = session_timeout_secs;
+    }
+    if let Some(workers) = cli.workers {
+        config.workers = workers;
+    }
+    if let Some(output) = cli.output {
+        config.output = output;
+    }
     let registry = Registry::load_dir(&config.manifest_dir)?;
 
     if let Command::Methods = cli.command {
@@ -167,10 +198,22 @@ fn run(
     // is scoring sessions the whole time.
     let print_incrementally = matches!(format, Format::Text);
     let consumer = thread::spawn(move || {
+        // `f0p`'s `every-observation` trigger re-confirms the same value on
+        // every packet once it's found one (see learning-records/0002) —
+        // storage stays append-only (that's the point of `evidence`), but a
+        // live tail printing the identical line dozens of times isn't
+        // "classification at packet rate," it's noise. Only print when a key
+        // actually changes value for that endpoint.
+        let mut last_printed: HashMap<(Endpoint, String), String> = HashMap::new();
         InferenceConsumer::consume_streaming(results, |evidence, store| {
             if print_incrementally {
-                if let Some(profile) = store.get(&evidence.subject) {
-                    println!("{}", render_line(&evidence.subject, profile));
+                let seen_key = (evidence.subject, evidence.key.clone());
+                let changed = last_printed.get(&seen_key) != Some(&evidence.value);
+                if changed {
+                    last_printed.insert(seen_key, evidence.value.clone());
+                    if let Some(profile) = store.get(&evidence.subject) {
+                        println!("{}", render_line(&evidence.subject, profile));
+                    }
                 }
             }
         })

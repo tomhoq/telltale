@@ -1,7 +1,7 @@
 name: banner
 description: >
-  Client software identification from plaintext banners and request headers —
-  User-Agent, SSH version strings, and similar.
+  Client software identification from the HTTP User-Agent header, matched
+  against known libraries, scanners, and research crawlers.
 enabled: true
 
 required-stage: app-data
@@ -18,8 +18,11 @@ database:
 output:
   fields:
     - name: client
-    - name: vendor
+      description: Identified tool or library, e.g. curl, sqlmap, Shodan.
+    - name: category
+      description: library | scanner | crawler | malformed
     - name: version
+      description: Version string, when the matched pattern has one to extract.
 
 params:
   # Never scan more than this much payload; a large transfer must not make the

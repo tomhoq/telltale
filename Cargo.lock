@@ -330,6 +330,8 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "pf-core",
+ "serde",
+ "serde_yaml",
  "tracing",
 ]
 

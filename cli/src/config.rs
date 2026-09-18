@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,8 +39,9 @@ pub struct PipelineConfig {
 }
 
 /// The decision that shapes everything else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
 pub enum OutputMode {
     /// Assemble the whole session, then score it once. Simpler and more
     /// accurate; useless for anything that has to react while traffic flows.
@@ -67,7 +69,7 @@ impl Default for PipelineConfig {
             manifest_dir: default_manifest_dir(),
             session_timeout_secs: default_timeout_secs(),
             workers: default_workers(),
-            output: OutputMode::PerSession,
+            output: OutputMode::InferenceTime,
             both_directions: false,
         }
     }
