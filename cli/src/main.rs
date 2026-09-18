@@ -157,7 +157,21 @@ fn main() -> pf_core::Result<()> {
                 Some(interface) => interface,
                 None => pick::interface()?,
             };
-            Box::new(LiveSource::open(interface, filter)?)
+            let source = LiveSource::open(interface, filter)?;
+            // Methods only look at what a session's initiator sent unless both
+            // directions were asked for — but this host's own outbound
+            // connections would make it an initiator too, so drop its traffic.
+            let source = if config.both_directions {
+                source
+            } else {
+                let source = source.incoming_only()?;
+                tracing::info!(
+                    dropping = ?source.dropped_sources(),
+                    "incoming only: ignoring traffic sent from this host"
+                );
+                source
+            };
+            Box::new(source)
         }
         Command::Replay { path } => Box::new(PcapFileSource::open(path)?),
         Command::Tcpdump { command } => Box::new(TcpdumpSource::spawn(command)?),

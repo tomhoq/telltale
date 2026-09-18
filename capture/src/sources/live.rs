@@ -29,6 +29,11 @@ pub struct LiveSource {
     /// in the future: BPF filter can b applied at the kernel, so uninteresting traffic never reaches
     /// user space.
     filter: Option<String>,
+    /// The interface's own addresses, read once at open.
+    addresses: Vec<IpAddr>,
+    /// Frames sent from any of these are dropped before they reach the
+    /// pipeline. Empty unless [`LiveSource::incoming_only`] was asked for.
+    drop_sources: Vec<IpAddr>,
     /// How the interface frames what it delivers. Ethernet everywhere except
     /// point-to-point links (tun, ppp), which hand over bare IP packets.
     link: Link,
@@ -83,11 +88,41 @@ impl LiveSource {
         };
 
         Ok(Self {
+            addresses: device.ips.iter().map(|network| network.ip()).collect(),
+            drop_sources: Vec::new(),
             interface,
             filter,
             link,
             receiver,
         })
+    }
+
+    /// Keep only traffic arriving at this host: drop every frame whose source
+    /// is one of the interface's own addresses. Without it, connections the
+    /// host opens itself make it the session initiator, and its own stack gets
+    /// fingerprinted as if it were the intruder.
+    ///
+    /// Fails on an interface with no addresses, where there is nothing to
+    /// filter by — capturing unfiltered instead would be the same silent
+    /// surprise [`LiveSource::open`] refuses for a BPF filter. On Windows pnet
+    /// only reports IPv4 addresses, so IPv6 traffic from this host still gets
+    /// through there.
+    pub fn incoming_only(mut self) -> Result<Self> {
+        if self.addresses.is_empty() {
+            return Err(Error::Capture(format!(
+                "`{}` has no IP address to tell incoming traffic apart by; \
+                 pick another interface or pass --both-directions",
+                self.interface
+            )));
+        }
+        self.drop_sources = self.addresses.clone();
+        Ok(self)
+    }
+
+    /// The addresses whose frames are being dropped; empty when both
+    /// directions are captured.
+    pub fn dropped_sources(&self) -> &[IpAddr] {
+        &self.drop_sources
     }
 
     pub fn interface(&self) -> &str {
@@ -133,6 +168,9 @@ impl Source for LiveSource {
             };
 
             if let Some(observation) = decoded {
+                if self.drop_sources.contains(&observation.source.addr) {
+                    continue;
+                }
                 return Ok(Some(observation));
             }
         }
