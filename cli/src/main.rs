@@ -12,10 +12,10 @@ use std::thread;
 use clap::{Parser, Subcommand, ValueEnum};
 use pf_capture::sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};
 use pf_capture::Source;
-use pf_core::{Endpoint, Observation, Session};
+use pf_core::{attribute_key, Endpoint, Evidence, Observation, Session};
 use pf_dispatch::{Assembler, Dispatcher, Emitted, Job};
 use pf_methods::Registry;
-use pf_output::{render_json, render_line, render_text, InferenceConsumer};
+use pf_output::{render_json, render_line, render_text, BatchConsumer, InferenceConsumer};
 
 use crate::config::{OutputMode, PipelineConfig};
 
@@ -195,39 +195,52 @@ fn run(
     // threaded through the dispatcher's own API.
     let registry = Arc::new(registry);
     let both_directions = config.both_directions;
+    // Each method's evidence is sent on the moment that method returns, not
+    // once the whole pass is done, so a fast method is never held back by a
+    // slower one after it.
     let analyze = {
         let registry = Arc::clone(&registry);
-        move |session: &Session, is_final: bool| registry.analyze(session, is_final, both_directions)
+        move |session: &Session, is_final: bool, emit: &mut dyn FnMut(Vec<Evidence>)| {
+            registry.analyze_each(session, is_final, both_directions, |produced| {
+                emit(produced.to_vec())
+            })
+        }
     };
     let (dispatcher, results) = Dispatcher::spawn(config.workers, analyze);
     let mut assembler = Assembler::new(config.session_timeout());
 
-    // A session finishes — times out, or the source ends — the moment its
-    // own inactivity window closes, which for `live`/`tcpdump` can be long
-    // before the run itself does; those sources never end on their own at
-    // all. Consuming results here, off a dedicated thread, as they arrive is
-    // what makes that visible: without it nothing prints until the capture
-    // loop below exits, which for those sources never happens, so it would
-    // look like nothing was ever being classified even though the dispatcher
-    // is scoring sessions the whole time.
-    let print_incrementally = matches!(format, Format::Text);
+    // Results are consumed off a dedicated thread as they arrive. `live` and
+    // `tcpdump` never end on their own, so in inference mode anything that
+    // waited for the capture loop below to exit would never print at all.
+    // Per-session mode (and JSON, which is one document) reports once, at the
+    // end, from the finished store.
+    let print_on_the_spot = config.output == OutputMode::InferenceTime && matches!(format, Format::Text);
     let consumer = thread::spawn(move || {
+        if !print_on_the_spot {
+            return BatchConsumer::consume(results);
+        }
         // `f0p`'s `every-observation` trigger re-confirms the same value on
         // every packet once it's found one (see learning-records/0002) —
         // storage stays append-only (that's the point of `evidence`), but a
         // live tail printing the identical line dozens of times isn't
-        // "classification at packet rate," it's noise. Only print when a key
-        // actually changes value for that endpoint.
+        // "classification at packet rate," it's noise. A method's result
+        // prints as one line, and only when it changes one of its keys for
+        // that endpoint — per method, the same way the store keys it.
         let mut last_printed: HashMap<(Endpoint, String), String> = HashMap::new();
-        InferenceConsumer::consume_streaming(results, |evidence, store| {
-            if print_incrementally {
-                let seen_key = (evidence.subject, evidence.key.clone());
-                let changed = last_printed.get(&seen_key) != Some(&evidence.value);
-                if changed {
+        InferenceConsumer::consume_streaming(results, |update, store| {
+            let mut changed_subjects: Vec<Endpoint> = Vec::new();
+            for evidence in update {
+                let seen_key = (evidence.subject, attribute_key(&evidence.method, &evidence.key));
+                if last_printed.get(&seen_key) != Some(&evidence.value) {
                     last_printed.insert(seen_key, evidence.value.clone());
-                    if let Some(profile) = store.get(&evidence.subject) {
-                        println!("{}", render_line(&evidence.subject, profile));
+                    if !changed_subjects.contains(&evidence.subject) {
+                        changed_subjects.push(evidence.subject);
                     }
+                }
+            }
+            for subject in changed_subjects {
+                if let Some(profile) = store.get(&subject) {
+                    println!("{}", render_line(&subject, profile));
                 }
             }
         })
@@ -268,7 +281,8 @@ fn run(
     let store = consumer.join().expect("result consumer thread should not panic");
 
     match format {
-        // Already streamed above, one line per update as it happened; this is
+        // In inference mode this follows the lines already printed as results
+        // came in; in per-session mode it is the only report. Either way it is
         // the final tally, grouped and sorted, once the run is actually over.
         Format::Text => print!("{}", render_text(&store)),
         Format::Json => print!("{}", render_json(&store)),

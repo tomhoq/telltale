@@ -32,10 +32,11 @@ pub fn render_text(store: &ProfileStore) -> String {
         ));
         let mut attributes: Vec<_> = profile.attributes.iter().collect();
         attributes.sort_by_key(|(key, _)| key.as_str());
+        // The key already names the method (`f0p.os`).
         for (key, attribute) in attributes {
             out.push_str(&format!(
-                "  {key:<16} {} ({:?}, via {})\n",
-                attribute.value, attribute.confidence, attribute.method
+                "  {key:<20} {} ({:?})\n",
+                attribute.value, attribute.confidence
             ));
         }
     }

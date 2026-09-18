@@ -34,8 +34,12 @@ output:
     - name: distance
       description: Estimated hop count, from the gap between the observed TTL and its nearest common initial value.
     - name: client
-      description: HTTP client/tool, from the User-Agent and header order.
+      description: HTTP client/tool, from the header order; Weak when the User-Agent claims something else.
+    - name: nearest
+      description: When no signature matches, the one sharing the most fields with the SYN. A near miss, not a classification — always Weak.
 
 params:
-  # Reject signature matches below this similarity.
+  # Matching follows p0f: window, MSS, scale, option layout and payload class
+  # must agree exactly. This only decides when a near miss is worth reporting
+  # as `nearest`: the share of signature fields it has to agree on.
   min-score: 0.8

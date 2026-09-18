@@ -99,6 +99,25 @@ impl Registry {
     /// honeypot that is the attacker, i.e. incoming traffic. true also exposes
     /// the responder's side via [`Context::observations`].
     pub fn analyze(&self, session: &Session, final_pass: bool, both_directions: bool) -> Vec<Evidence> {
+        let mut all = Vec::new();
+        self.analyze_each(session, final_pass, both_directions, |produced| {
+            all.extend_from_slice(produced)
+        });
+        all
+    }
+
+    /// [`Registry::analyze`], but handing each method's evidence to `emit` the
+    /// moment that method returns, rather than once every method has run — so
+    /// a fast method's result is not held back by a slow one after it. `emit`
+    /// is called once per method that produced something, never with an empty
+    /// slice.
+    pub fn analyze_each(
+        &self,
+        session: &Session,
+        final_pass: bool,
+        both_directions: bool,
+        mut emit: impl FnMut(&[Evidence]),
+    ) {
         let mut evidence: Vec<Evidence> = Vec::new();
 
         for method in &self.methods {
@@ -137,6 +156,7 @@ impl Registry {
             };
 
             let provisional = !final_pass && matches!(outcome, Outcome::Partial(_));
+            let first_new = evidence.len();
             for mut item in outcome.evidence().to_vec() {
                 if !manifest.output.declares(&item.key) {
                     // The manifest and its adapter have drifted apart. Loud,
@@ -151,9 +171,10 @@ impl Registry {
                 item.provisional = provisional;
                 evidence.push(item);
             }
+            if evidence.len() > first_new {
+                emit(&evidence[first_new..]);
+            }
         }
-
-        evidence
     }
 }
 
@@ -169,6 +190,74 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("manifests");
         let registry = Registry::load_dir(&dir).expect("shipped manifests should load");
         assert!(!registry.is_empty(), "no methods loaded from {dir:?}");
+    }
+
+    /// A SYN then a curl request: `f0p` and `banner` both have something to
+    /// say, and each says it in its own emit, in priority order, rather than
+    /// the two arriving together at the end of the pass.
+    #[test]
+    fn each_method_reports_in_its_own_emit() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::SystemTime;
+
+        use pf_core::{Endpoint, Observation, Stage, TcpFeatures, TcpOptionKind, Transport};
+
+        let client = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            port: 47236,
+        };
+        let server = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8)),
+            port: 5173,
+        };
+        let segment = |stage: Stage, payload: &[u8], tcp: Option<TcpFeatures>| Observation {
+            at: SystemTime::UNIX_EPOCH,
+            source: client,
+            destination: server,
+            transport: Transport::Tcp,
+            payload: payload.to_vec(),
+            stage_hint: Some(stage),
+            tcp,
+        };
+        let syn = TcpFeatures {
+            ttl: 64,
+            df: true,
+            window: 64240,
+            mss: Some(1460),
+            window_scale: Some(7),
+            sack_permitted: true,
+            timestamp: true,
+            option_order: vec![
+                TcpOptionKind::Mss,
+                TcpOptionKind::SackPermitted,
+                TcpOptionKind::Timestamp,
+                TcpOptionKind::Nop,
+                TcpOptionKind::WindowScale,
+            ],
+            eol_padding: None,
+        };
+
+        let mut session = Session::open(segment(Stage::Connect, b"", Some(syn)));
+        session.push(segment(
+            Stage::Established,
+            b"GET / HTTP/1.1\r\nHost: 10.0.0.8:5173\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n",
+            None,
+        ));
+        session.advance(Stage::AppData);
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("manifests");
+        let registry = Registry::load_dir(&dir).expect("shipped manifests should load");
+
+        let mut emits: Vec<Vec<String>> = Vec::new();
+        registry.analyze_each(&session, false, false, |produced| {
+            emits.push(produced.iter().map(|e| e.method.clone()).collect());
+        });
+
+        let methods: Vec<&str> = emits.iter().map(|emit| emit[0].as_str()).collect();
+        assert_eq!(methods, ["f0p", "banner"]);
+        for emit in &emits {
+            assert!(emit.iter().all(|m| m == &emit[0]), "one emit mixed methods: {emit:?}");
+        }
     }
 
     /// Fusion must come last so the evidence it combines already exists.

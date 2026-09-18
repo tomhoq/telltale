@@ -14,6 +14,25 @@ pub enum Emitted {
     Finished(Session),
 }
 
+/// The stage a segment's payload proves the session has reached, if any. A
+/// TLS ClientHello is its own stage, which is what `ja4`-style methods wait
+/// for; any other bytes mean application data is flowing, which is what
+/// `banner`-style methods wait for.
+fn payload_stage(payload: &[u8]) -> Option<Stage> {
+    if payload.is_empty() {
+        return None;
+    }
+    // TLS record header: handshake (0x16), major version 3, then two bytes of
+    // minor version and two of length; the handshake type after it is 1 for
+    // ClientHello.
+    let client_hello = payload.len() > 5 && payload[0] == 0x16 && payload[1] == 0x03 && payload[5] == 0x01;
+    Some(if client_hello {
+        Stage::TlsClientHello
+    } else {
+        Stage::AppData
+    })
+}
+
 /// 5-tuple + timeout session correlation.
 ///
 /// Single-threaded on purpose: this sits on the capture thread and hands
@@ -45,16 +64,26 @@ impl Assembler {
             observation.transport,
         );
 
+        // The flags only say where the handshake is; whether application
+        // bytes have started is read off the payload here.
+        // TODO: FIN/RST -> Closed, from session lifecycle (see
+        // `pf_capture::decode::tcp_stage` on why not from one packet).
+        let payload_stage = payload_stage(&observation.payload);
+
         match self.sessions.get_mut(&key) {
             Some(session) => {
                 session.push(observation);
-                // TODO: infer stage transitions from the packet itself
-                // (SYN/ACK -> Established, ClientHello -> TlsClientHello,
-                // FIN/RST -> Closed) instead of relying only on stage_hint.
+                if let Some(stage) = payload_stage {
+                    session.advance(stage);
+                }
                 Emitted::Updated(key)
             }
             None => {
-                self.sessions.insert(key, Session::open(observation));
+                let mut session = Session::open(observation);
+                if let Some(stage) = payload_stage {
+                    session.advance(stage);
+                }
+                self.sessions.insert(key, session);
                 Emitted::Opened(key)
             }
         }
@@ -104,5 +133,83 @@ impl Assembler {
 
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use pf_core::{Endpoint, Transport};
+
+    use super::*;
+
+    fn segment(from_port: u16, stage_hint: Option<Stage>, payload: &[u8]) -> Observation {
+        let host = |last, port| Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)),
+            port,
+        };
+        let (source, destination) = if from_port == 80 {
+            (host(1, 80), host(7, 50905))
+        } else {
+            (host(7, 50905), host(1, 80))
+        };
+        Observation {
+            at: SystemTime::UNIX_EPOCH,
+            source,
+            destination,
+            transport: Transport::Tcp,
+            payload: payload.to_vec(),
+            stage_hint,
+            tcp: None,
+        }
+    }
+
+    fn stage_after(segments: Vec<Observation>) -> Stage {
+        let mut assembler = Assembler::new(Duration::from_secs(30));
+        let mut key = None;
+        for segment in segments {
+            key = Some(match assembler.ingest(segment) {
+                Emitted::Opened(key) | Emitted::Updated(key) => key,
+                Emitted::Finished(_) => unreachable!("nothing finishes mid-ingest here"),
+            });
+        }
+        assembler.get(&key.unwrap()).unwrap().stage
+    }
+
+    #[test]
+    fn a_handshake_alone_is_established_not_app_data() {
+        let stage = stage_after(vec![
+            segment(50905, Some(Stage::Connect), b""),
+            segment(80, Some(Stage::Established), b""),
+            segment(50905, Some(Stage::Established), b""),
+        ]);
+        assert_eq!(stage, Stage::Established);
+    }
+
+    /// What `banner` waits for: before this, no session ever reached
+    /// `app-data` until it timed out.
+    #[test]
+    fn an_http_request_reaches_app_data() {
+        let stage = stage_after(vec![
+            segment(50905, Some(Stage::Connect), b""),
+            segment(80, Some(Stage::Established), b""),
+            segment(
+                50905,
+                Some(Stage::Established),
+                b"GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: curl/8.5.0\r\n\r\n",
+            ),
+        ]);
+        assert_eq!(stage, Stage::AppData);
+    }
+
+    #[test]
+    fn a_tls_client_hello_reaches_its_own_stage() {
+        let client_hello = [0x16, 0x03, 0x01, 0x00, 0xa5, 0x01, 0x00, 0x00, 0xa1];
+        let stage = stage_after(vec![
+            segment(50905, Some(Stage::Connect), b""),
+            segment(50905, Some(Stage::Established), &client_hello),
+        ]);
+        assert_eq!(stage, Stage::TlsClientHello);
     }
 }

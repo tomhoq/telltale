@@ -24,6 +24,9 @@ pub enum Verdict {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
     pub verdict: Verdict,
+    /// Keyed `<method>.<key>` (`f0p.os`, `banner.client`), so each method's
+    /// claims stay visible side by side rather than one method's answer
+    /// hiding another's. Weighing them against each other is fusion's job.
     pub attributes: HashMap<String, Attribute>,
     pub evidence: Vec<Evidence>,
 }
@@ -33,6 +36,11 @@ pub struct Attribute {
     pub value: String,
     pub confidence: Confidence,
     pub method: String,
+}
+
+/// The name an attribute is stored and shown under: `<method>.<key>`.
+pub fn attribute_key(method: &str, key: &str) -> String {
+    format!("{method}.{key}")
 }
 
 /// In-memory accumulator, keyed by the endpoint being judged.
@@ -46,41 +54,26 @@ impl ProfileStore {
         Self::default()
     }
 
-    /// Fold one claim in. Stronger confidence wins; equal confidence from the
-    /// same method overwrites (a streaming re-run refining its own provisional
-    /// answer); equal confidence from a different method is a genuine conflict.
+    /// Fold one claim in, under its method's own name for the key. Within one
+    /// method a stronger claim is kept over a weaker one; equal confidence
+    /// overwrites (a streaming re-run refining its own provisional answer).
     pub fn record(&mut self, evidence: Evidence) {
         let profile = self.profiles.entry(evidence.subject).or_default();
+        let key = attribute_key(&evidence.method, &evidence.key);
 
-        match profile.attributes.get(&evidence.key) {
-            Some(existing) if existing.confidence > evidence.confidence => {}
-            Some(existing)
-                if existing.confidence == evidence.confidence
-                    && existing.method != evidence.method
-                    && existing.value != evidence.value =>
-            {
-                // TODO: conflicting equal-confidence claims from different
-                // methods. Recording the newest is a placeholder — decide
-                // whether to keep both and let fusion arbitrate.
-                profile.attributes.insert(
-                    evidence.key.clone(),
-                    Attribute {
-                        value: evidence.value.clone(),
-                        confidence: evidence.confidence,
-                        method: evidence.method.clone(),
-                    },
-                );
-            }
-            _ => {
-                profile.attributes.insert(
-                    evidence.key.clone(),
-                    Attribute {
-                        value: evidence.value.clone(),
-                        confidence: evidence.confidence,
-                        method: evidence.method.clone(),
-                    },
-                );
-            }
+        let keep_existing = profile
+            .attributes
+            .get(&key)
+            .is_some_and(|existing| existing.confidence > evidence.confidence);
+        if !keep_existing {
+            profile.attributes.insert(
+                key,
+                Attribute {
+                    value: evidence.value.clone(),
+                    confidence: evidence.confidence,
+                    method: evidence.method.clone(),
+                },
+            );
         }
 
         profile.evidence.push(evidence);
@@ -96,5 +89,45 @@ impl ProfileStore {
 
     pub fn iter(&self) -> impl Iterator<Item = (&Endpoint, &Profile)> {
         self.profiles.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    fn subject() -> Endpoint {
+        Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+            port: 50726,
+        }
+    }
+
+    fn claim(method: &str, key: &str, value: &str, confidence: Confidence) -> Evidence {
+        Evidence::new(method, subject(), key, value, confidence)
+    }
+
+    #[test]
+    fn the_same_key_from_two_methods_is_kept_apart() {
+        let mut store = ProfileStore::new();
+        store.record(claim("f0p", "client", "Safari", Confidence::Likely));
+        store.record(claim("banner", "client", "curl", Confidence::Strong));
+
+        let attributes = &store.get(&subject()).unwrap().attributes;
+        assert_eq!(attributes["f0p.client"].value, "Safari");
+        assert_eq!(attributes["banner.client"].value, "curl");
+    }
+
+    #[test]
+    fn within_a_method_a_weaker_claim_does_not_replace_a_stronger_one() {
+        let mut store = ProfileStore::new();
+        store.record(claim("f0p", "os", "Linux", Confidence::Strong));
+        store.record(claim("f0p", "os", "FreeBSD", Confidence::Weak));
+        assert_eq!(store.get(&subject()).unwrap().attributes["f0p.os"].value, "Linux");
+
+        store.record(claim("f0p", "os", "Linux 3.11", Confidence::Strong));
+        assert_eq!(store.get(&subject()).unwrap().attributes["f0p.os"].value, "Linux 3.11");
     }
 }

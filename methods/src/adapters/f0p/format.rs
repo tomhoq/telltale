@@ -32,9 +32,8 @@ pub enum WindowSpec {
     /// completeness since the grammar documents it even though the shipped
     /// `[tcp:request]` signatures do not currently use it.
     Modulo(u32),
-    /// `mtu*N` — window is a multiple of the link MTU, guessed from the
-    /// `[mtu]` module this parser does not implement. Carried through
-    /// unmodified but never counted for or against a match.
+    /// `mtu*N` — window is `N` times the MTU the segment's own MSS implies
+    /// (MSS plus minimal IP and TCP headers).
     MtuMultiple(u32),
 }
 
@@ -100,6 +99,9 @@ pub struct HttpHeaderExpectation {
 /// One `[http:request]` signature.
 #[derive(Debug, Clone)]
 pub struct HttpSignature {
+    /// `s` (specific) vs `g` (generic), with the same precedence as the TCP
+    /// signatures.
+    pub specific: bool,
     pub label: String,
     /// `0` / `1` from `HTTP/1.x`, or `None` for `*` (either).
     pub http_minor_version: Option<u8>,
@@ -110,8 +112,8 @@ pub struct HttpSignature {
     /// Header names (lower-cased) that must *not* appear anywhere.
     pub header_absent: Vec<String>,
     /// Expected substring in User-Agent. Informational in real p0f (it flags
-    /// dishonest software rather than gating the match); `f0p` uses it as an
-    /// extra soft signal.
+    /// dishonest software rather than gating the match); `f0p` does the same,
+    /// lowering the confidence of a match the User-Agent disagrees with.
     pub expected_software: Option<String>,
 }
 
@@ -351,6 +353,7 @@ fn parse_http_sig(value: &str, current: &PendingLabel) -> Option<HttpSignature> 
     let expected_software = (!expsw.is_empty()).then(|| expsw.to_string());
 
     Some(HttpSignature {
+        specific: current.specific,
         label: current.label.clone(),
         http_minor_version,
         header_order,

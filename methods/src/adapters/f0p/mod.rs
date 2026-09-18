@@ -50,6 +50,9 @@ fn nearest_initial_ttl(observed: u8) -> u8 {
         .unwrap_or(255)
 }
 
+/// Share of the checked fields that agree, every field counting the same.
+/// Not a match test — [`fit_tcp`] is — only a measure of how close a
+/// signature came, for reporting the nearest one when nothing matched.
 fn score_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &TcpSignature) -> f64 {
     let mut checks = 0.0_f64;
     let mut matches = 0.0_f64;
@@ -72,25 +75,9 @@ fn score_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &
         matches += (observed.mss == Some(mss)) as u8 as f64;
     }
 
-    match sig.window {
-        WindowSpec::Any => {}
-        WindowSpec::Fixed(window) => {
-            checks += 1.0;
-            matches += (observed.window == window) as u8 as f64;
-        }
-        WindowSpec::MssMultiple(n) => {
-            checks += 1.0;
-            let expected = observed.mss.map(|mss| mss as u32 * n);
-            matches += (expected == Some(observed.window as u32)) as u8 as f64;
-        }
-        WindowSpec::Modulo(n) if n > 0 => {
-            checks += 1.0;
-            matches += (observed.window as u32 % n == 0) as u8 as f64;
-        }
-        WindowSpec::Modulo(_) => {}
-        // Needs the `[mtu]` module's own guessing, which this parser does not
-        // implement — not counted for or against a match.
-        WindowSpec::MtuMultiple(_) => {}
+    if !matches!(sig.window, WindowSpec::Any | WindowSpec::Modulo(0)) {
+        checks += 1.0;
+        matches += window_fits(observed, ip_version, sig.window) as u8 as f64;
     }
 
     // Real signatures carry a literal `scale` even when their `olayout` has
@@ -184,53 +171,153 @@ fn option_layout_text(options: &[TcpOptionKind], eol_padding: Option<u8>) -> Str
     tokens.join(",")
 }
 
-/// The highest-scoring signature regardless of `min-score`, for showing what
-/// the matcher came closest to when nothing (or something surprising) matched.
+/// Whether the observed window satisfies a signature's `wsize`.
+fn window_fits(observed: &TcpFeatures, ip_version: u8, spec: WindowSpec) -> bool {
+    let window = observed.window as u32;
+    match spec {
+        WindowSpec::Any => true,
+        WindowSpec::Fixed(expected) => observed.window == expected,
+        WindowSpec::MssMultiple(n) => observed.mss.is_some_and(|mss| mss as u32 * n == window),
+        // The MTU p0f means here is the one implied by the MSS: MSS plus the
+        // minimal IP and TCP headers.
+        WindowSpec::MtuMultiple(n) => {
+            let headers = if ip_version == 6 { 60 } else { 40 };
+            observed
+                .mss
+                .is_some_and(|mss| (mss as u32 + headers) * n == window)
+        }
+        WindowSpec::Modulo(0) => true,
+        WindowSpec::Modulo(n) => window % n == 0,
+    }
+}
+
+/// How one observed SYN stands against one signature, in p0f's terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    /// A field that identifies the stack differs: not this signature.
+    Mismatch,
+    /// Every checked field agrees.
+    Exact,
+    /// Everything identifying agrees, but TTL is out of range or an expected
+    /// DF is missing — p0f's "fuzzy" match: the same stack, seen through
+    /// something that rewrote a header on the way.
+    Fuzzy,
+}
+
+/// p0f's matching rules for one `[tcp:request]` signature. The window, MSS,
+/// scale, option layout and payload class identify a stack and must agree;
+/// only TTL and a missing DF are forgiven, and then only as a fuzzy match.
+/// Fields `TcpFeatures` does not carry (IP option length, quirks other than
+/// DF) are not checked at all.
+fn fit_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &TcpSignature) -> Fit {
+    if sig.ip_version.is_some_and(|expected| expected != ip_version) {
+        return Fit::Mismatch;
+    }
+    if sig.mss.is_some_and(|expected| observed.mss != Some(expected)) {
+        return Fit::Mismatch;
+    }
+    if !window_fits(observed, ip_version, sig.window) {
+        return Fit::Mismatch;
+    }
+    // See `score_tcp` on why the scale only counts when the layout has `ws`.
+    if sig.option_layout.contains(&TcpOptionKind::WindowScale)
+        && sig
+            .window_scale
+            .is_some_and(|expected| observed.window_scale != Some(expected))
+    {
+        return Fit::Mismatch;
+    }
+    if observed.option_order != sig.option_layout || observed.eol_padding != sig.eol_padding {
+        return Fit::Mismatch;
+    }
+    let payload_ok = match sig.payload_class {
+        PayloadClass::Zero => payload_empty,
+        PayloadClass::NonZero => !payload_empty,
+        PayloadClass::Any => true,
+    };
+    if !payload_ok {
+        return Fit::Mismatch;
+    }
+
+    // DF: p0f forgives the bit disappearing (a middlebox can clear it) but not
+    // appearing where the signature has none. IPv6 has no DF bit at all —
+    // `TcpFeatures` reports it as set there — so it is not compared.
+    let sig_df = sig.quirks.iter().any(|q| q == "df");
+    let df_ok = ip_version == 6 || observed.df == sig_df;
+    if ip_version != 6 && observed.df && !sig_df {
+        return Fit::Mismatch;
+    }
+
+    // TTL: a ceiling (`64-`) is a hard limit, since the tool randomizes below
+    // it; a normal initial TTL out of range only makes the match fuzzy.
+    if sig.ittl_is_ceiling && observed.ttl > sig.initial_ttl {
+        return Fit::Mismatch;
+    }
+    let ttl_ok = sig.ittl_is_ceiling
+        || (observed.ttl <= sig.initial_ttl
+            && sig.initial_ttl - observed.ttl <= MAX_PLAUSIBLE_HOPS);
+
+    if ttl_ok && df_ok {
+        Fit::Exact
+    } else {
+        Fit::Fuzzy
+    }
+}
+
+/// p0f's own precedence: the first exact specific signature; failing that,
+/// the first exact generic one ("generic signatures are considered only if no
+/// specific matches are found"); failing that, the first fuzzy one. File order
+/// breaks ties, as in p0f.
+fn best_tcp_match<'a>(
+    signatures: &'a [TcpSignature],
+    observed: &TcpFeatures,
+    payload_empty: bool,
+    ip_version: u8,
+) -> Option<(&'a TcpSignature, Fit)> {
+    let mut generic = None;
+    let mut fuzzy = None;
+    for sig in signatures {
+        match fit_tcp(observed, payload_empty, ip_version, sig) {
+            Fit::Exact if sig.specific => return Some((sig, Fit::Exact)),
+            Fit::Exact => {
+                generic.get_or_insert(sig);
+            }
+            Fit::Fuzzy => {
+                fuzzy.get_or_insert(sig);
+            }
+            Fit::Mismatch => {}
+        }
+    }
+    generic
+        .map(|sig| (sig, Fit::Exact))
+        .or(fuzzy.map(|sig| (sig, Fit::Fuzzy)))
+}
+
+fn tcp_confidence(sig: &TcpSignature, fit: Fit) -> Confidence {
+    match fit {
+        Fit::Exact if sig.specific => Confidence::Strong,
+        Fit::Exact => Confidence::Likely,
+        _ => Confidence::Weak,
+    }
+}
+
+/// The signature sharing the most fields with the SYN, regardless of which
+/// ones — for showing what the matcher came closest to when nothing matched.
+/// The first in file order wins a tie.
 fn nearest_tcp_signature<'a>(
     signatures: &'a [TcpSignature],
     observed: &TcpFeatures,
     payload_empty: bool,
     ip_version: u8,
 ) -> Option<(&'a TcpSignature, f64)> {
-    signatures
-        .iter()
-        .map(|sig| (sig, score_tcp(observed, payload_empty, ip_version, sig)))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-}
-
-/// Best match, preferring a specific (`s`) signature over a generic (`g`)
-/// one even when a generic one scores higher — p0f's own README: "generic
-/// signatures are considered only if no specific matches are found".
-fn best_tcp_match<'a>(
-    signatures: &'a [TcpSignature],
-    observed: &TcpFeatures,
-    payload_empty: bool,
-    ip_version: u8,
-    min_score: f64,
-) -> Option<(&'a TcpSignature, f64)> {
-    let mut specific_best: Option<(&TcpSignature, f64)> = None;
-    let mut generic_best: Option<(&TcpSignature, f64)> = None;
-
+    let mut nearest: Option<(&TcpSignature, f64)> = None;
     for sig in signatures {
         let score = score_tcp(observed, payload_empty, ip_version, sig);
-        if score < min_score {
-            continue;
-        }
-        let slot = if sig.specific {
-            &mut specific_best
-        } else {
-            &mut generic_best
-        };
-        let better = match slot {
-            Some((_, best)) => score > *best,
-            None => true,
-        };
-        if better {
-            *slot = Some((sig, score));
+        if nearest.is_none_or(|(_, best)| score > best) {
+            nearest = Some((sig, score));
         }
     }
-
-    specific_best.or(generic_best)
+    nearest
 }
 
 const HTTP_METHODS: [&str; 8] = [
@@ -319,57 +406,54 @@ fn header_order_matches(observed: &ObservedHttpRequest, expected: &[HttpHeaderEx
     true
 }
 
-fn score_http(observed: &ObservedHttpRequest, sig: &HttpSignature) -> f64 {
-    let mut checks = 0.0_f64;
-    let mut matches = 0.0_f64;
-
-    if let Some(expected) = sig.http_minor_version {
-        checks += 1.0;
-        matches += (observed.minor_version == Some(expected)) as u8 as f64;
-    }
-
-    checks += 1.0;
-    matches += header_order_matches(observed, &sig.header_order) as u8 as f64;
-
-    if !sig.header_absent.is_empty() {
-        checks += 1.0;
-        let clean = sig
+/// p0f's matching rules for one `[http:request]` signature: HTTP version,
+/// header order and absent headers all have to agree. The User-Agent is not
+/// part of the match — see [`software_agrees`].
+fn http_fits(observed: &ObservedHttpRequest, sig: &HttpSignature) -> bool {
+    sig.http_minor_version
+        .is_none_or(|expected| observed.minor_version == Some(expected))
+        && header_order_matches(observed, &sig.header_order)
+        && sig
             .header_absent
             .iter()
-            .all(|absent| observed.header_value(absent).is_none());
-        matches += clean as u8 as f64;
-    }
-
-    if let Some(expected) = &sig.expected_software {
-        checks += 1.0;
-        let user_agent = observed.header_value("user-agent").unwrap_or("");
-        matches += user_agent
-            .to_ascii_lowercase()
-            .contains(&expected.to_ascii_lowercase()) as u8 as f64;
-    }
-
-    matches / checks
+            .all(|absent| observed.header_value(absent).is_none())
 }
 
+/// Whether the User-Agent claims the software the headers look like. p0f does
+/// not reject a match over this; it flags the client as dishonest — a tool
+/// that sets a browser's User-Agent but not its header order, say.
+fn software_agrees(observed: &ObservedHttpRequest, sig: &HttpSignature) -> bool {
+    let Some(expected) = &sig.expected_software else {
+        return true;
+    };
+    observed
+        .header_value("user-agent")
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .contains(&expected.to_ascii_lowercase())
+}
+
+/// Same precedence as the TCP side: the first specific signature that fits,
+/// else the first generic one.
 fn best_http_match<'a>(
     signatures: &'a [HttpSignature],
     observed: &ObservedHttpRequest,
-    min_score: f64,
-) -> Option<(&'a HttpSignature, f64)> {
-    signatures
-        .iter()
-        .map(|sig| (sig, score_http(observed, sig)))
-        .filter(|(_, score)| *score >= min_score)
-        .max_by(|a, b| a.1.total_cmp(&b.1))
+) -> Option<&'a HttpSignature> {
+    let mut generic = None;
+    for sig in signatures.iter().filter(|sig| http_fits(observed, sig)) {
+        if sig.specific {
+            return Some(sig);
+        }
+        generic.get_or_insert(sig);
+    }
+    generic
 }
 
-fn confidence_for(score: f64) -> Confidence {
-    if score >= 0.95 {
-        Confidence::Strong
-    } else if score >= 0.85 {
-        Confidence::Likely
-    } else {
-        Confidence::Weak
+fn http_confidence(observed: &ObservedHttpRequest, sig: &HttpSignature) -> Confidence {
+    match (sig.specific, software_agrees(observed, sig)) {
+        (_, false) => Confidence::Weak,
+        (true, true) => Confidence::Strong,
+        (false, true) => Confidence::Likely,
     }
 }
 
@@ -422,13 +506,7 @@ impl Method for F0p {
             IpAddr::V6(_) => 6,
         };
 
-        let best_tcp = best_tcp_match(
-            &self.db.tcp_request,
-            syn,
-            payload_empty,
-            ip_version,
-            self.min_score,
-        );
+        let best_tcp = best_tcp_match(&self.db.tcp_request, syn, payload_empty, ip_version);
 
         let mut evidence = Vec::new();
 
@@ -436,12 +514,12 @@ impl Method for F0p {
         // checked against p0f's output or the database by eye.
         let observed_sig = raw_signature(syn, payload_empty, ip_version);
         match best_tcp {
-            Some((sig, score)) => tracing::debug!(
+            Some((sig, fit)) => tracing::debug!(
                 subject = ?ctx.session.initiator,
                 observed = %observed_sig,
                 matched = %sig.label,
                 matched_sig = %sig.raw,
-                score,
+                ?fit,
                 "f0p tcp match"
             ),
             None => {
@@ -452,8 +530,19 @@ impl Method for F0p {
                     nearest = nearest.map(|(sig, _)| sig.label.as_str()),
                     nearest_sig = nearest.map(|(sig, _)| sig.raw.as_str()),
                     nearest_score = nearest.map(|(_, score)| score),
-                    "f0p tcp: no signature above min-score"
-                )
+                    "f0p tcp: no signature matches"
+                );
+                // Visible, but under its own key and never above Weak, so a
+                // near miss cannot be read as a classification.
+                if let Some((sig, _)) = nearest.filter(|(_, score)| *score >= self.min_score) {
+                    evidence.push(Evidence::new(
+                        self.name(),
+                        ctx.session.initiator,
+                        "nearest",
+                        sig.label.clone(),
+                        Confidence::Weak,
+                    ));
+                }
             }
         }
         evidence.push(Evidence::new(
@@ -479,7 +568,7 @@ impl Method for F0p {
             Confidence::Weak,
         ));
 
-        if let Some((sig, score)) = best_tcp {
+        if let Some((sig, fit)) = best_tcp {
             // `class == "!"` is p0f's own convention for a tool/application
             // signature rather than an OS one (NMap's raw-socket SYN
             // signatures live in `[tcp:request]` right alongside the OS
@@ -490,7 +579,7 @@ impl Method for F0p {
                 ctx.session.initiator,
                 key,
                 sig.label.clone(),
-                confidence_for(score),
+                tcp_confidence(sig, fit),
             ));
         }
 
@@ -502,14 +591,13 @@ impl Method for F0p {
             .observations()
             .find_map(|o| ObservedHttpRequest::parse(&o.payload))
         {
-            if let Some((sig, score)) = best_http_match(&self.db.http_request, &request, self.min_score)
-            {
+            if let Some(sig) = best_http_match(&self.db.http_request, &request) {
                 evidence.push(Evidence::new(
                     self.name(),
                     ctx.session.initiator,
                     "client",
                     sig.label.clone(),
-                    confidence_for(score),
+                    http_confidence(&request, sig),
                 ));
             }
         }
@@ -609,15 +697,60 @@ mod tests {
         assert_eq!(score_tcp(&iphone_syn(), true, 4, generic_mac), 1.0);
     }
 
-    /// Only guards against the old answer. Which Apple entry wins is still
-    /// decided by a tie among near-misses (every specific Apple signature has
-    /// the wrong window scale for this phone), so it is not asserted here.
+    /// The signature p0f's database has for exactly this SYN is the generic
+    /// Mac OS X one — every specific Apple entry lists a window scale of 1-4,
+    /// and this phone sends 6. An exact generic match beats any near miss.
     #[test]
-    fn an_iphone_is_no_longer_taken_for_freebsd() {
+    fn an_iphone_matches_the_generic_mac_signature_exactly() {
         let db = vendored_db();
-        let (sig, _) = best_tcp_match(&db.tcp_request, &iphone_syn(), true, 4, 0.8)
-            .expect("an Apple signature should match");
-        assert!(!sig.label.starts_with("FreeBSD"), "matched {}", sig.label);
+        let (sig, fit) = best_tcp_match(&db.tcp_request, &iphone_syn(), true, 4)
+            .expect("the generic Mac OS X signature should match");
+        assert_eq!(sig.label, "Mac OS X");
+        assert!(!sig.specific);
+        assert_eq!(fit, Fit::Exact);
+        assert_eq!(tcp_confidence(sig, fit), Confidence::Likely);
+    }
+
+    /// FreeBSD 9 agrees on everything but the option layout, which is what
+    /// the old share-of-fields scoring let through.
+    #[test]
+    fn a_different_option_layout_is_never_a_match() {
+        let db = vendored_db();
+        let freebsd = db
+            .tcp_request
+            .iter()
+            .find(|sig| sig.label == "FreeBSD 9.x or newer")
+            .unwrap();
+        assert_eq!(fit_tcp(&iphone_syn(), true, 4, freebsd), Fit::Mismatch);
+    }
+
+    /// A current Linux SYN (MSS 1460, window `mss*44`, scale 7). p0f's
+    /// specific entries stop at Linux 3.11's `mss*20`; what catches it is the
+    /// generic Linux entry, whose window and scale are wildcards — the same
+    /// answer real p0f gives.
+    #[test]
+    fn a_modern_linux_syn_falls_back_to_the_generic_linux_signature() {
+        let mut modern_linux = linux_syn();
+        modern_linux.window = 1460 * 44;
+        let db = vendored_db();
+        let (sig, fit) = best_tcp_match(&db.tcp_request, &modern_linux, true, 4).unwrap();
+        assert_eq!(sig.label, "Linux 2.2.x-3.x");
+        assert!(!sig.specific);
+        assert_eq!(fit, Fit::Exact);
+    }
+
+    /// Linux's options with one NOP too many: no signature has that layout,
+    /// so nothing matches, and the Linux entries are only the nearest.
+    #[test]
+    fn a_layout_nobody_sends_matches_nothing_but_has_a_nearest() {
+        use TcpOptionKind::*;
+        let mut odd = linux_syn();
+        odd.option_order = vec![Mss, SackPermitted, Timestamp, Nop, WindowScale, Nop];
+        let db = vendored_db();
+        assert!(best_tcp_match(&db.tcp_request, &odd, true, 4).is_none());
+        let (nearest, score) = nearest_tcp_signature(&db.tcp_request, &odd, true, 4).unwrap();
+        assert!(nearest.label.starts_with("Linux"), "nearest was {}", nearest.label);
+        assert!(score < 1.0);
     }
 
     #[test]
@@ -638,11 +771,12 @@ mod tests {
             .unwrap();
         let mut observed = iphone_syn();
         observed.eol_padding = Some(3);
-        assert!(score_tcp(&observed, true, 4, generic_mac) < 1.0);
+        assert_eq!(fit_tcp(&observed, true, 4, generic_mac), Fit::Mismatch);
     }
 
     #[test]
-    fn a_full_match_against_the_real_grammar_scores_one() {
+    fn a_full_match_against_the_real_grammar_is_exact() {
+        assert_eq!(fit_tcp(&linux_syn(), true, 4, &linux_signature()), Fit::Exact);
         assert_eq!(score_tcp(&linux_syn(), true, 4, &linux_signature()), 1.0);
     }
 
@@ -650,14 +784,105 @@ mod tests {
     fn a_hop_away_still_matches_via_the_signatures_own_initial_ttl() {
         let mut observed = linux_syn();
         observed.ttl = 59; // 5 hops between attacker and honeypot
-        assert_eq!(score_tcp(&observed, true, 4, &linux_signature()), 1.0);
+        assert_eq!(fit_tcp(&observed, true, 4, &linux_signature()), Fit::Exact);
+    }
+
+    /// TTL alone does not rule a stack out in p0f — something on the path can
+    /// rewrite it — it only makes the match fuzzy.
+    #[test]
+    fn a_ttl_out_of_range_makes_the_match_fuzzy() {
+        let mut observed = linux_syn();
+        observed.ttl = 128;
+        assert_eq!(fit_tcp(&observed, true, 4, &linux_signature()), Fit::Fuzzy);
+    }
+
+    /// A ceiling (`64-`) is different: the tool randomizes under it, so a TTL
+    /// above it is a different tool.
+    #[test]
+    fn a_ttl_above_a_ceiling_is_a_mismatch() {
+        let sig = format::parse(
+            "[tcp:request]\n\
+             label = s:!:NMap:SYN scan\n\
+             sig   = *:64-:0:1460:1024,0:mss::0\n",
+        )
+        .tcp_request
+        .remove(0);
+        let mut observed = linux_syn();
+        observed.window = 1024;
+        observed.df = false;
+        observed.option_order = vec![TcpOptionKind::Mss];
+        observed.ttl = 41;
+        assert_eq!(fit_tcp(&observed, true, 4, &sig), Fit::Exact);
+        observed.ttl = 65;
+        assert_eq!(fit_tcp(&observed, true, 4, &sig), Fit::Mismatch);
     }
 
     #[test]
-    fn a_windows_ttl_does_not_match_a_linux_signature() {
+    fn df_disappearing_is_fuzzy_but_appearing_is_a_mismatch() {
+        let mut no_df = linux_syn();
+        no_df.df = false;
+        assert_eq!(fit_tcp(&no_df, true, 4, &linux_signature()), Fit::Fuzzy);
+
+        let sig_without_df = format::parse(
+            "[tcp:request]\n\
+             label = s:unix:Linux:3.11 and newer\n\
+             sig   = *:64:0:*:mss*20,7:mss,sok,ts,nop,ws:id+:0\n",
+        )
+        .tcp_request
+        .remove(0);
+        assert_eq!(fit_tcp(&linux_syn(), true, 4, &sig_without_df), Fit::Mismatch);
+    }
+
+    /// IPv6 has no DF bit, so it neither helps nor hurts there.
+    #[test]
+    fn df_is_not_compared_on_ipv6() {
         let mut observed = linux_syn();
-        observed.ttl = 128;
-        assert!(score_tcp(&observed, true, 4, &linux_signature()) < 1.0);
+        observed.df = false;
+        assert_eq!(fit_tcp(&observed, true, 6, &linux_signature()), Fit::Exact);
+    }
+
+    #[test]
+    fn an_mtu_multiple_window_is_checked_against_the_mss_implied_mtu() {
+        let sig = format::parse(
+            "[tcp:request]\n\
+             label = s:unix:Test:mtu\n\
+             sig   = *:64:0:*:mtu*4,7:mss,sok,ts,nop,ws:df:0\n",
+        )
+        .tcp_request
+        .remove(0);
+        let mut observed = linux_syn();
+        observed.window = 1500 * 4; // MSS 1460 + 40 bytes of IPv4/TCP headers
+        assert_eq!(fit_tcp(&observed, true, 4, &sig), Fit::Exact);
+        observed.window = 1460 * 4;
+        assert_eq!(fit_tcp(&observed, true, 4, &sig), Fit::Mismatch);
+    }
+
+    #[test]
+    fn an_exact_generic_match_beats_a_fuzzy_specific_one() {
+        let db = format::parse(
+            "[tcp:request]\n\
+             label = s:unix:Specific:but TTL is off\n\
+             sig   = *:128:0:*:mss*20,7:mss,sok,ts,nop,ws:df:0\n\
+             label = g:unix:Generic:\n\
+             sig   = *:64:0:*:mss*20,*:mss,sok,ts,nop,ws:df:0\n",
+        );
+        let (sig, fit) = best_tcp_match(&db.tcp_request, &linux_syn(), true, 4).unwrap();
+        assert_eq!(sig.label, "Generic");
+        assert_eq!(fit, Fit::Exact);
+    }
+
+    #[test]
+    fn an_exact_specific_match_beats_an_exact_generic_one() {
+        let db = format::parse(
+            "[tcp:request]\n\
+             label = g:unix:Generic:\n\
+             sig   = *:64:0:*:mss*20,*:mss,sok,ts,nop,ws:df:0\n\
+             label = s:unix:Specific:\n\
+             sig   = *:64:0:*:mss*20,7:mss,sok,ts,nop,ws:df:0\n",
+        );
+        let (sig, fit) = best_tcp_match(&db.tcp_request, &linux_syn(), true, 4).unwrap();
+        assert_eq!(sig.label, "Specific");
+        assert_eq!(tcp_confidence(sig, fit), Confidence::Strong);
     }
 
     #[test]
@@ -673,11 +898,12 @@ mod tests {
         observed.option_order = vec![];
         observed.window = 1024;
         observed.mss = Some(1460);
-        assert_eq!(score_tcp(&observed, true, 4, &sig), 1.0);
+        observed.df = false;
+        assert_eq!(fit_tcp(&observed, true, 4, &sig), Fit::Exact);
 
         let mut with_options = observed.clone();
         with_options.option_order = vec![TcpOptionKind::Mss];
-        assert!(score_tcp(&with_options, true, 4, &sig) < 1.0);
+        assert_eq!(fit_tcp(&with_options, true, 4, &sig), Fit::Mismatch);
     }
 
     #[test]
@@ -709,9 +935,56 @@ mod tests {
             b"GET / HTTP/1.1\r\nUser-Agent: curl/8.4.0\r\nHost: honeypot\r\nAccept: */*\r\n\r\n",
         )
         .unwrap();
-        let (sig, score) = best_http_match(&db.http_request, &request, 0.8).expect("curl should match");
+        let sig = best_http_match(&db.http_request, &request).expect("curl should match");
         assert_eq!(sig.label, "curl");
-        assert_eq!(score, 1.0);
+        assert_eq!(http_confidence(&request, sig), Confidence::Strong);
+    }
+
+    /// p0f flags this rather than rejecting it: the headers are curl's, the
+    /// User-Agent claims a browser. Still a match, but only Weak.
+    #[test]
+    fn a_user_agent_that_disagrees_with_the_headers_is_weak_not_rejected() {
+        let db = format::parse(
+            "[http:request]\n\
+             label = s:!:curl:\n\
+             sig   = 1:User-Agent,Host,Accept=[*/*]::curl/\n",
+        );
+        let request = ObservedHttpRequest::parse(
+            b"GET / HTTP/1.1\r\nUser-Agent: Mozilla/5.0 Safari\r\nHost: honeypot\r\nAccept: */*\r\n\r\n",
+        )
+        .unwrap();
+        let sig = best_http_match(&db.http_request, &request).expect("the headers still fit curl");
+        assert_eq!(http_confidence(&request, sig), Confidence::Weak);
+    }
+
+    #[test]
+    fn a_specific_http_signature_beats_a_generic_one() {
+        let db = format::parse(
+            "[http:request]\n\
+             label = g:!:Generic client:\n\
+             sig   = *:Host::\n\
+             label = s:!:curl:\n\
+             sig   = 1:User-Agent,Host::curl/\n",
+        );
+        let request = ObservedHttpRequest::parse(
+            b"GET / HTTP/1.1\r\nUser-Agent: curl/8.4.0\r\nHost: honeypot\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(best_http_match(&db.http_request, &request).unwrap().label, "curl");
+    }
+
+    #[test]
+    fn a_wrong_http_version_is_not_a_match() {
+        let db = format::parse(
+            "[http:request]\n\
+             label = s:!:curl:\n\
+             sig   = 1:User-Agent,Host::curl/\n",
+        );
+        let request = ObservedHttpRequest::parse(
+            b"GET / HTTP/1.0\r\nUser-Agent: curl/8.4.0\r\nHost: honeypot\r\n\r\n",
+        )
+        .unwrap();
+        assert!(best_http_match(&db.http_request, &request).is_none());
     }
 
     #[test]
