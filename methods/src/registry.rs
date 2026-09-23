@@ -200,7 +200,7 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
         use std::time::SystemTime;
 
-        use pf_core::{Endpoint, Observation, Stage, TcpFeatures, TcpOptionKind, Transport};
+        use pf_core::{Endpoint, Observation, Stage, TcpFeatures, TcpOptionKind, TcpQuirk, Transport};
 
         let client = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
@@ -221,7 +221,8 @@ mod tests {
         };
         let syn = TcpFeatures {
             ttl: 64,
-            df: true,
+            ip_option_len: 0,
+            quirks: [TcpQuirk::Df, TcpQuirk::NonZeroId].into(),
             window: 64240,
             mss: Some(1460),
             window_scale: Some(7),

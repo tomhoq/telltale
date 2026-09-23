@@ -11,17 +11,17 @@
 //! live interface, undecodable frames are constant background noise, and a
 //! source that failed on them would not survive its first second of traffic.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::SystemTime;
 
-use pf_core::{Endpoint, Observation, Stage, TcpFeatures, TcpOptionKind, Transport};
+use pf_core::{Endpoint, Observation, Stage, TcpFeatures, TcpOptionKind, TcpQuirk, Transport};
 use pnet::packet::ethernet::{EtherType, EtherTypes, EthernetPacket};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::{TcpFlags, TcpOptionNumbers, TcpPacket};
+use pnet::packet::tcp::{TcpFlags, TcpPacket};
 use pnet::packet::udp::UdpPacket;
-use pnet::packet::Packet;
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const VLAN_TAG_LEN: usize = 4;
@@ -29,6 +29,16 @@ const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const TCP_MIN_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
+
+/// The IPv4 flag bit RFC 791 reserves, "must be zero". pnet names DF and MF
+/// but not this one.
+const IPV4_RESERVED_FLAG: u8 = 0b100;
+/// The two ECN bits at the bottom of the IPv4 TOS / IPv6 traffic class.
+const ECN_MASK: u8 = 0b11;
+/// TCP's ECN-nonce bit, the lowest bit of the nibble pnet calls `reserved`.
+const TCP_NS: u8 = 0b0001;
+/// RFC 7323: a window scale shift above this is invalid.
+const MAX_WINDOW_SCALE: u8 = 14;
 
 /// Stacked VLAN tags to unwrap before giving up. Two covers 802.1Q and QinQ;
 /// the bound is what stops a crafted frame from walking us off the end.
@@ -96,8 +106,26 @@ fn ipv4(packet: &[u8], at: SystemTime) -> Option<Observation> {
         return None;
     }
 
-    let ttl = ip.get_ttl();
-    let df = ip.get_flags() & Ipv4Flags::DontFragment != 0;
+    // p0f's IPv4 quirks. The ID only means something relative to DF: a stack
+    // that forbids fragmentation has no use for an ID, so which way it goes
+    // there is a choice the stack made.
+    let mut quirks = BTreeSet::new();
+    let flags = ip.get_flags();
+    let id = ip.get_identification();
+    if flags & Ipv4Flags::DontFragment != 0 {
+        quirks.insert(TcpQuirk::Df);
+        if id != 0 {
+            quirks.insert(TcpQuirk::NonZeroId);
+        }
+    } else if id == 0 {
+        quirks.insert(TcpQuirk::ZeroId);
+    }
+    if flags & IPV4_RESERVED_FLAG != 0 {
+        quirks.insert(TcpQuirk::NonZeroReserved);
+    }
+    if ip.get_ecn() != 0 {
+        quirks.insert(TcpQuirk::Ecn);
+    }
 
     transport(
         ip.get_next_level_protocol(),
@@ -105,8 +133,11 @@ fn ipv4(packet: &[u8], at: SystemTime) -> Option<Observation> {
         IpAddr::V4(ip.get_destination()),
         &packet[header_len..end],
         at,
-        ttl,
-        df,
+        IpLayer {
+            ttl: ip.get_ttl(),
+            option_len: (header_len - IPV4_MIN_HEADER_LEN) as u8,
+            quirks,
+        },
     )
 }
 
@@ -119,17 +150,36 @@ fn ipv6(packet: &[u8], at: SystemTime) -> Option<Observation> {
     // then a packet carrying one decodes as `Transport::Other(proto)`, which
     // loses the ports but is at least not a TCP header read off the wrong
     // offset.
+
+    // IPv6 has neither DF nor an ID in its fixed header; its quirks are a
+    // flow label and ECN in the traffic class.
+    let mut quirks = BTreeSet::new();
+    if ip.get_flow_label() != 0 {
+        quirks.insert(TcpQuirk::Flow);
+    }
+    if ip.get_traffic_class() & ECN_MASK != 0 {
+        quirks.insert(TcpQuirk::Ecn);
+    }
+
     transport(
         ip.get_next_header(),
         IpAddr::V6(ip.get_source()),
         IpAddr::V6(ip.get_destination()),
         &packet[IPV6_HEADER_LEN..end],
         at,
-        ip.get_hop_limit(),
-        // No fragment extension header seen (we don't walk the chain yet), so
-        // nothing says this datagram may be fragmented.
-        true,
+        IpLayer {
+            ttl: ip.get_hop_limit(),
+            option_len: 0,
+            quirks,
+        },
     )
+}
+
+/// What the IP header contributes to [`TcpFeatures`].
+struct IpLayer {
+    ttl: u8,
+    option_len: u8,
+    quirks: BTreeSet<TcpQuirk>,
 }
 
 fn transport(
@@ -138,8 +188,7 @@ fn transport(
     destination: IpAddr,
     segment: &[u8],
     at: SystemTime,
-    ttl: u8,
-    df: bool,
+    ip: IpLayer,
 ) -> Option<Observation> {
     let (transport, source_port, destination_port, payload, stage_hint, tcp) = match protocol {
         IpNextHeaderProtocols::Tcp => {
@@ -154,7 +203,7 @@ fn transport(
                 tcp_packet.get_destination(),
                 &segment[header_len..],
                 tcp_stage(tcp_packet.get_flags()),
-                Some(tcp_features(&tcp_packet, ttl, df)),
+                Some(tcp_features(&tcp_packet, ip)),
             )
         }
         IpNextHeaderProtocols::Udp => {
@@ -192,70 +241,147 @@ fn transport(
 }
 
 /// Every TCP/IP stack characteristic a passive fingerprinting method might
-/// want off one segment: the IP-layer TTL/DF the caller already parsed, plus
-/// the TCP window and options as they arrived on the wire — order, padding
-/// and all, since which options a stack sends and in what order is as
-/// diagnostic as their values. Which of this is actually diagnostic is a
-/// method's call, not this crate's; it is carried on [`Observation`] as-is.
-fn tcp_features(tcp: &TcpPacket, ttl: u8, df: bool) -> TcpFeatures {
+/// want off one segment: what the IP header contributed (TTL, option length,
+/// its quirks), plus the TCP window, options and quirks as they arrived on
+/// the wire — order, padding and all, since which options a stack sends and
+/// in what order is as diagnostic as their values. Which of this is actually
+/// diagnostic is a method's call, not this crate's; it is carried on
+/// [`Observation`] as-is.
+///
+/// The quirks are p0f's, computed the way p0f computes them, so a method
+/// matching p0f's database compares like with like.
+fn tcp_features(tcp: &TcpPacket, ip: IpLayer) -> TcpFeatures {
+    let mut quirks = ip.quirks;
+    let flags = tcp.get_flags();
+    let is_initial_syn = flags & (TcpFlags::SYN | TcpFlags::ACK) == TcpFlags::SYN;
+
+    if flags & (TcpFlags::ECE | TcpFlags::CWR) != 0 || tcp.get_reserved() & TCP_NS != 0 {
+        quirks.insert(TcpQuirk::Ecn);
+    }
+    if tcp.get_sequence() == 0 {
+        quirks.insert(TcpQuirk::ZeroSeq);
+    }
+    // An acknowledgement number is only meaningful under ACK. A RST without
+    // ACK may still echo one, so that alone is not held against the stack.
+    if flags & TcpFlags::ACK != 0 {
+        if tcp.get_acknowledgement() == 0 {
+            quirks.insert(TcpQuirk::ZeroAck);
+        }
+    } else if tcp.get_acknowledgement() != 0 && flags & TcpFlags::RST == 0 {
+        quirks.insert(TcpQuirk::NonZeroAck);
+    }
+    if flags & TcpFlags::URG != 0 {
+        quirks.insert(TcpQuirk::Urg);
+    } else if tcp.get_urgent_ptr() != 0 {
+        quirks.insert(TcpQuirk::NonZeroUrgentPtr);
+    }
+    if flags & TcpFlags::PSH != 0 {
+        quirks.insert(TcpQuirk::Push);
+    }
+
     let mut mss = None;
     let mut window_scale = None;
     let mut sack_permitted = false;
     let mut timestamp = false;
     let mut option_order = Vec::new();
     let mut eol_padding = None;
-    // Bytes of the options area walked so far, to know how much is left once
-    // an EOL ends the list.
-    let mut consumed = 0usize;
 
-    for option in tcp.get_options_iter() {
-        let data = option.payload();
-        let kind = match option.get_number() {
-            TcpOptionNumbers::EOL => TcpOptionKind::Eol,
-            TcpOptionNumbers::NOP => TcpOptionKind::Nop,
-            TcpOptionNumbers::MSS => {
-                if let [a, b] = *data {
-                    mss = Some(u16::from_be_bytes([a, b]));
-                }
-                TcpOptionKind::Mss
-            }
-            TcpOptionNumbers::WSCALE => {
-                if let [shift] = *data {
-                    window_scale = Some(shift);
-                }
-                TcpOptionKind::WindowScale
-            }
-            TcpOptionNumbers::SACK_PERMITTED => {
-                sack_permitted = true;
-                TcpOptionKind::SackPermitted
-            }
-            TcpOptionNumbers::SACK => TcpOptionKind::Sack,
-            TcpOptionNumbers::TIMESTAMPS => {
-                timestamp = true;
-                TcpOptionKind::Timestamp
-            }
-            other => TcpOptionKind::Other(other.0),
+    // Walked by hand rather than with pnet's option iterator: a malformed
+    // option is itself a quirk (`bad`), and so is non-zero padding after EOL
+    // (`opt+`), and the iterator hides both. Like p0f, an option is listed
+    // before its length is checked, and the walk stops at the first one that
+    // runs off the end of the header.
+    let raw = tcp.get_options_raw();
+    let mut at = 0usize;
+    while at < raw.len() {
+        let kind = match raw[at] {
+            0 => TcpOptionKind::Eol,
+            1 => TcpOptionKind::Nop,
+            2 => TcpOptionKind::Mss,
+            3 => TcpOptionKind::WindowScale,
+            4 => TcpOptionKind::SackPermitted,
+            5 => TcpOptionKind::Sack,
+            8 => TcpOptionKind::Timestamp,
+            other => TcpOptionKind::Other(other),
         };
         option_order.push(kind);
 
-        // EOL and NOP are a single kind byte; every other option is kind,
-        // length, then data.
-        consumed += match kind {
-            TcpOptionKind::Eol | TcpOptionKind::Nop => 1,
-            _ => 2 + data.len(),
+        match kind {
+            // Whatever follows EOL pads the header out to its 4-byte
+            // boundary. It is not more options, so it is counted rather than
+            // decoded — but a stack that pads with anything but zeros is
+            // leaking something, and that is worth knowing.
+            TcpOptionKind::Eol => {
+                let padding = &raw[at + 1..];
+                eol_padding = Some(padding.len() as u8);
+                if padding.iter().any(|&byte| byte != 0) {
+                    quirks.insert(TcpQuirk::NonZeroPadding);
+                }
+                break;
+            }
+            TcpOptionKind::Nop => {
+                at += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Every other option is kind, length (counting both), then data.
+        let Some(&len) = raw.get(at + 1) else {
+            quirks.insert(TcpQuirk::BadOptions);
+            break;
         };
-        // Whatever follows EOL pads the header out to its 4-byte boundary. It
-        // is not more options, so it is counted rather than decoded.
-        if kind == TcpOptionKind::Eol {
-            let padding = tcp.get_options_raw().len().saturating_sub(consumed);
-            eol_padding = Some(padding as u8);
+        let len = len as usize;
+        if len < 2 || at + len > raw.len() {
+            quirks.insert(TcpQuirk::BadOptions);
             break;
         }
+        let data = &raw[at + 2..at + len];
+        let valid_len = match kind {
+            TcpOptionKind::Mss => data.len() == 2,
+            TcpOptionKind::WindowScale => data.len() == 1,
+            TcpOptionKind::SackPermitted => data.is_empty(),
+            // One to four blocks of two 32-bit edges.
+            TcpOptionKind::Sack => (8..=32).contains(&data.len()) && data.len() % 8 == 0,
+            TcpOptionKind::Timestamp => data.len() == 8,
+            _ => true,
+        };
+        if !valid_len {
+            quirks.insert(TcpQuirk::BadOptions);
+        }
+
+        match kind {
+            TcpOptionKind::Mss if valid_len => mss = Some(u16::from_be_bytes([data[0], data[1]])),
+            TcpOptionKind::WindowScale if valid_len => {
+                window_scale = Some(data[0]);
+                if data[0] > MAX_WINDOW_SCALE {
+                    quirks.insert(TcpQuirk::ExcessiveWindowScale);
+                }
+            }
+            TcpOptionKind::SackPermitted => sack_permitted = true,
+            TcpOptionKind::Timestamp => {
+                timestamp = true;
+                if valid_len {
+                    let own = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    let peer = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                    if own == 0 {
+                        quirks.insert(TcpQuirk::ZeroTimestamp);
+                    }
+                    // Nothing to echo yet on an initial SYN.
+                    if peer != 0 && is_initial_syn {
+                        quirks.insert(TcpQuirk::NonZeroPeerTimestamp);
+                    }
+                }
+            }
+            _ => {}
+        }
+        at += len;
     }
 
     TcpFeatures {
-        ttl,
-        df,
+        ttl: ip.ttl,
+        ip_option_len: ip.option_len,
+        quirks,
         window: tcp.get_window(),
         mss,
         window_scale,
@@ -470,6 +596,130 @@ mod tests {
 
         assert_eq!(tcp.option_order, vec![TcpOptionKind::Mss, TcpOptionKind::Eol]);
         assert_eq!(tcp.eol_padding, Some(3));
+        assert!(tcp.quirks.contains(&TcpQuirk::NonZeroPadding));
+    }
+
+    #[test]
+    fn zero_padding_after_eol_is_not_a_quirk() {
+        let options = [2, 4, 0x05, 0xB4, 0, 0, 0, 0]; // MSS, EOL, 3 zero bytes
+        let tcp = syn_features(&options);
+        assert_eq!(tcp.eol_padding, Some(3));
+        assert!(!tcp.quirks.contains(&TcpQuirk::NonZeroPadding));
+    }
+
+    /// The decode of one SYN carrying `options`, straight to its features.
+    fn syn_features(options: &[u8]) -> TcpFeatures {
+        let frame = ethernet(
+            0x0800,
+            &ipv4(6, &tcp_with_options(51234, 443, TcpFlags::SYN, options, &[])),
+        );
+        ethernet_frame(&frame, SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .tcp
+            .expect("a TCP segment should carry features")
+    }
+
+    /// The test builders send DF with a zero ID and a zero sequence number —
+    /// exactly p0f's `df` and `seq-`, and nothing else.
+    #[test]
+    fn a_plain_syn_carries_only_the_quirks_it_has() {
+        let tcp = syn_features(&[]);
+        assert_eq!(
+            tcp.quirks.into_iter().collect::<Vec<_>>(),
+            vec![TcpQuirk::Df, TcpQuirk::ZeroSeq]
+        );
+        assert_eq!(tcp.ip_option_len, 0);
+    }
+
+    #[test]
+    fn ip_id_and_sequence_quirks_follow_p0f() {
+        let mut frame = ethernet(0x0800, &ipv4(6, &tcp(51234, 22, TcpFlags::SYN, &[])));
+        let ip = ETHERNET_HEADER_LEN;
+        let tcp_at = ip + IPV4_MIN_HEADER_LEN;
+        frame[ip + 4..ip + 6].copy_from_slice(&0x1234u16.to_be_bytes()); // IP ID
+        frame[tcp_at + 4..tcp_at + 8].copy_from_slice(&7u32.to_be_bytes()); // seq
+        let quirks = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap().tcp.unwrap().quirks;
+        assert_eq!(
+            quirks.into_iter().collect::<Vec<_>>(),
+            vec![TcpQuirk::Df, TcpQuirk::NonZeroId]
+        );
+
+        // No DF and a zero ID is `id-`; the reserved flag is `0+`.
+        frame[ip + 4..ip + 6].copy_from_slice(&[0, 0]);
+        frame[ip + 6] = 0x80;
+        let quirks = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap().tcp.unwrap().quirks;
+        assert_eq!(
+            quirks.into_iter().collect::<Vec<_>>(),
+            vec![TcpQuirk::ZeroId, TcpQuirk::NonZeroReserved]
+        );
+    }
+
+    #[test]
+    fn tcp_header_quirks_follow_p0f() {
+        let mut frame = ethernet(
+            0x0800,
+            &ipv4(6, &tcp(51234, 22, TcpFlags::SYN | TcpFlags::PSH | TcpFlags::ECE, &[])),
+        );
+        let tcp_at = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        frame[tcp_at + 8..tcp_at + 12].copy_from_slice(&9u32.to_be_bytes()); // ack, no ACK flag
+        frame[tcp_at + 18..tcp_at + 20].copy_from_slice(&1u16.to_be_bytes()); // urgent ptr, no URG
+        let quirks = ethernet_frame(&frame, SystemTime::UNIX_EPOCH).unwrap().tcp.unwrap().quirks;
+        for quirk in [
+            TcpQuirk::Ecn,
+            TcpQuirk::NonZeroAck,
+            TcpQuirk::NonZeroUrgentPtr,
+            TcpQuirk::Push,
+        ] {
+            assert!(quirks.contains(&quirk), "missing {quirk:?} in {quirks:?}");
+        }
+    }
+
+    #[test]
+    fn ipv4_options_are_counted() {
+        let mut packet = ipv4(6, &tcp(51234, 22, TcpFlags::SYN, &[]));
+        packet[0] = 0x46; // IHL 6 words: 4 bytes of options
+        packet.splice(IPV4_MIN_HEADER_LEN..IPV4_MIN_HEADER_LEN, [1, 1, 1, 0]);
+        let total = packet.len() as u16;
+        packet[2..4].copy_from_slice(&total.to_be_bytes());
+        let tcp = ip_packet(&packet, SystemTime::UNIX_EPOCH).unwrap().tcp.unwrap();
+        assert_eq!(tcp.ip_option_len, 4);
+    }
+
+    #[test]
+    fn timestamp_and_window_scale_quirks_follow_p0f() {
+        let options = [
+            8, 10, 0, 0, 0, 0, 0, 0, 0, 5, // own timestamp 0, peer timestamp 5
+            3, 3, 15, // window scale past the maximum
+        ];
+        let tcp = syn_features(&options);
+        for quirk in [
+            TcpQuirk::ZeroTimestamp,
+            TcpQuirk::NonZeroPeerTimestamp,
+            TcpQuirk::ExcessiveWindowScale,
+        ] {
+            assert!(tcp.quirks.contains(&quirk), "missing {quirk:?} in {:?}", tcp.quirks);
+        }
+        assert_eq!(tcp.window_scale, Some(15));
+    }
+
+    /// An option that runs off the end of the header is listed, marked `bad`,
+    /// and ends the walk, the way p0f does it.
+    #[test]
+    fn a_truncated_option_is_bad_and_stops_the_walk() {
+        let options = [2, 4, 0x05, 0xB4, 8, 10, 0, 0]; // MSS, then a timestamp cut short
+        let tcp = syn_features(&options);
+        assert!(tcp.quirks.contains(&TcpQuirk::BadOptions));
+        assert_eq!(tcp.option_order, vec![TcpOptionKind::Mss, TcpOptionKind::Timestamp]);
+        assert_eq!(tcp.mss, Some(1460));
+    }
+
+    #[test]
+    fn a_wrong_option_length_is_bad() {
+        let options = [2, 3, 0x05, 3, 3, 7, 0, 0]; // MSS claiming 3 bytes, then ws
+        let tcp = syn_features(&options);
+        assert!(tcp.quirks.contains(&TcpQuirk::BadOptions));
+        assert_eq!(tcp.mss, None);
+        assert_eq!(tcp.window_scale, Some(7));
     }
 
     #[test]
@@ -506,7 +756,7 @@ mod tests {
 
         let tcp = observation.tcp.expect("a TCP segment should carry features");
         assert_eq!(tcp.ttl, 64);
-        assert!(tcp.df);
+        assert!(tcp.df());
         assert_eq!(tcp.window, 0x7120);
         assert_eq!(tcp.mss, Some(1460));
         assert_eq!(tcp.window_scale, Some(7));

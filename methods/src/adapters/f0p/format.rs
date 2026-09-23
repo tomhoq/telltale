@@ -17,7 +17,9 @@
 //! Do not fail the whole database over one line neither p0f nor this parser
 //! has ever needed to reject outright.
 
-use pf_core::{DatabaseSpec, Result, TcpOptionKind};
+use std::collections::BTreeSet;
+
+use pf_core::{DatabaseSpec, Result, TcpOptionKind, TcpQuirk};
 
 use crate::db::Database;
 
@@ -74,12 +76,10 @@ pub struct TcpSignature {
     /// `None` when the layout has no EOL. Same shape as
     /// `TcpFeatures::eol_padding`, so the two compare directly.
     pub eol_padding: Option<u8>,
-    /// Raw quirk tokens (`df`, `id+`, `ecn`, `ack+`, ...), kept verbatim.
-    /// `f0p`'s matcher currently only checks `df`, because that is the only
-    /// one `pf_core::TcpFeatures` observes yet — the ID/ECN/sequence/ack/urg
-    /// quirks ride along unused rather than being silently dropped, so a
-    /// later capture-layer extension has them ready to score.
-    pub quirks: Vec<String>,
+    /// `olen`: bytes of IPv4 header options the stack sends.
+    pub ip_option_len: u8,
+    /// The quirks (`df`, `id+`, `ecn`, `ack+`, ...) the stack's SYN carries.
+    pub quirks: BTreeSet<TcpQuirk>,
     pub payload_class: PayloadClass,
 }
 
@@ -217,7 +217,7 @@ fn parse_tcp_sig(value: &str, current: &PendingLabel) -> Option<TcpSignature> {
     let mut fields = value.splitn(8, ':');
     let ver = fields.next()?;
     let ittl = fields.next()?;
-    let _olen = fields.next()?;
+    let ip_option_len = fields.next()?.parse().ok()?;
     let mss = fields.next()?;
     let wsize_scale = fields.next()?;
     let olayout = fields.next()?;
@@ -261,11 +261,13 @@ fn parse_tcp_sig(value: &str, current: &PendingLabel) -> Option<TcpSignature> {
         .find_map(|t| t.strip_prefix("eol"))
         .map(|rest| rest.strip_prefix('+').and_then(|n| n.parse().ok()).unwrap_or(0));
 
+    // An unknown quirk drops the signature: matching it while ignoring the
+    // quirk would make it match more than p0f lets it.
     let quirks = quirks
         .split(',')
         .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect();
+        .map(parse_quirk)
+        .collect::<Option<_>>()?;
 
     let payload_class = match pclass {
         "0" => PayloadClass::Zero,
@@ -281,6 +283,7 @@ fn parse_tcp_sig(value: &str, current: &PendingLabel) -> Option<TcpSignature> {
         ip_version,
         initial_ttl,
         ittl_is_ceiling,
+        ip_option_len,
         mss,
         window,
         window_scale,
@@ -321,6 +324,42 @@ fn parse_option_token(token: &str) -> TcpOptionKind {
         _ if token.starts_with("eol") => TcpOptionKind::Eol,
         _ => TcpOptionKind::Other(0),
     }
+}
+
+/// p0f's name for each quirk, as signatures and its `raw_sig` spell them.
+const QUIRK_TOKENS: [(TcpQuirk, &str); 17] = [
+    (TcpQuirk::Df, "df"),
+    (TcpQuirk::NonZeroId, "id+"),
+    (TcpQuirk::ZeroId, "id-"),
+    (TcpQuirk::Ecn, "ecn"),
+    (TcpQuirk::NonZeroReserved, "0+"),
+    (TcpQuirk::Flow, "flow"),
+    (TcpQuirk::ZeroSeq, "seq-"),
+    (TcpQuirk::NonZeroAck, "ack+"),
+    (TcpQuirk::ZeroAck, "ack-"),
+    (TcpQuirk::NonZeroUrgentPtr, "uptr+"),
+    (TcpQuirk::Urg, "urgf+"),
+    (TcpQuirk::Push, "pushf+"),
+    (TcpQuirk::ZeroTimestamp, "ts1-"),
+    (TcpQuirk::NonZeroPeerTimestamp, "ts2+"),
+    (TcpQuirk::NonZeroPadding, "opt+"),
+    (TcpQuirk::ExcessiveWindowScale, "exws"),
+    (TcpQuirk::BadOptions, "bad"),
+];
+
+pub fn parse_quirk(token: &str) -> Option<TcpQuirk> {
+    QUIRK_TOKENS
+        .iter()
+        .find(|(_, name)| *name == token)
+        .map(|(quirk, _)| *quirk)
+}
+
+pub fn quirk_token(quirk: TcpQuirk) -> &'static str {
+    QUIRK_TOKENS
+        .iter()
+        .find(|(q, _)| *q == quirk)
+        .map(|(_, name)| *name)
+        .expect("every quirk has a p0f token")
 }
 
 fn parse_http_sig(value: &str, current: &PendingLabel) -> Option<HttpSignature> {
@@ -444,7 +483,11 @@ sig   = *:64:0:*:mss*20,10:mss,sok,ts,nop,ws:df,id+:0
             ]
         );
         assert_eq!(sig.eol_padding, None);
-        assert_eq!(sig.quirks, vec!["df", "id+"]);
+        assert_eq!(sig.ip_option_len, 0);
+        assert_eq!(
+            sig.quirks.iter().copied().collect::<Vec<_>>(),
+            vec![TcpQuirk::Df, TcpQuirk::NonZeroId]
+        );
         assert_eq!(sig.payload_class, PayloadClass::Zero);
     }
 
@@ -496,6 +539,25 @@ sig   = *:64:0:*:mss*20,7:mss,sok,ts,nop,ws:df,id+:0
         let db = parse(text);
         assert_eq!(db.tcp_request.len(), 1);
         assert_eq!(db.tcp_request[0].label, "Linux should appear");
+    }
+
+    #[test]
+    fn every_quirk_token_round_trips() {
+        for (quirk, token) in QUIRK_TOKENS {
+            assert_eq!(parse_quirk(token), Some(quirk));
+            assert_eq!(quirk_token(quirk), token);
+        }
+    }
+
+    #[test]
+    fn a_signature_with_an_unknown_quirk_is_dropped() {
+        let text = "\
+[tcp:request]
+
+label = s:unix:Linux:bogus
+sig   = *:64:0:*:mss*20,7:mss,sok,ts,nop,ws:df,wat:0
+";
+        assert!(parse(text).tcp_request.is_empty());
     }
 
     #[test]

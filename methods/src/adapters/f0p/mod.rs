@@ -12,21 +12,22 @@
 //! characteristics out of one fingerprint file rather than treating them as
 //! separate tools.
 //!
-//! What this does *not* attempt is a byte-exact reimplementation of p0f's own
-//! matching engine — its quirk/ECN/sequence-number fuzziness rules are its
-//! own C code, not reproduced here. What it does keep exact is the data: the
-//! database is p0f's, unmodified, and every signature field this module
-//! cannot yet check (see [`format::TcpSignature`]) is parsed and carried
-//! through rather than silently discarded, so scoring can grow into it later.
+//! The TCP matcher follows p0f's own rules (`fp_tcp.c`): every field of a
+//! `[tcp:request]` signature is checked, quirks included, and p0f's fuzzy
+//! cases — TTL out of range, `df`/`id+` disappearing, `id-`/`ecn` appearing —
+//! are reproduced as fuzzy matches. The one deliberate difference is IPv6,
+//! where the IPv4-only quirks of a `*` signature are not expected (see
+//! [`quirks_fit`]).
 
 mod format;
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::Path;
 
 use pf_core::{
-    Confidence, Context, Evidence, Method, MethodManifest, Outcome, Result, TcpFeatures,
-    TcpOptionKind, Transport,
+    Confidence, Context, Evidence, Method, MethodManifest, Outcome, Result, Stage, TcpFeatures,
+    TcpOptionKind, TcpQuirk, Transport,
 };
 
 use crate::db;
@@ -40,8 +41,8 @@ const COMMON_INITIAL_TTLS: [u8; 4] = [32, 64, 128, 255];
 
 /// Hops between attacker and honeypot beyond this are treated as "this isn't
 /// really the same initial TTL, just an unlucky low reading" rather than
-/// trusted as a genuine distance.
-const MAX_PLAUSIBLE_HOPS: u8 = 40;
+/// trusted as a genuine distance. p0f's own `MAX_DIST`.
+const MAX_DIST: u8 = 35;
 
 fn nearest_initial_ttl(observed: u8) -> u8 {
     COMMON_INITIAL_TTLS
@@ -56,67 +57,34 @@ fn nearest_initial_ttl(observed: u8) -> u8 {
 fn score_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &TcpSignature) -> f64 {
     let mut checks = 0.0_f64;
     let mut matches = 0.0_f64;
+    let mut check = |agrees: bool| {
+        checks += 1.0;
+        matches += agrees as u8 as f64;
+    };
 
     if let Some(expected) = sig.ip_version {
-        checks += 1.0;
-        matches += (ip_version == expected) as u8 as f64;
+        check(ip_version == expected);
     }
-
-    checks += 1.0;
-    let ttl_ok = if sig.ittl_is_ceiling {
-        observed.ttl <= sig.initial_ttl
-    } else {
-        observed.ttl <= sig.initial_ttl && sig.initial_ttl - observed.ttl <= MAX_PLAUSIBLE_HOPS
-    };
-    matches += ttl_ok as u8 as f64;
-
+    check(ttl_in_range(observed.ttl, sig));
+    check(observed.ip_option_len == sig.ip_option_len);
     if let Some(mss) = sig.mss {
-        checks += 1.0;
-        matches += (observed.mss == Some(mss)) as u8 as f64;
+        check(observed.mss.unwrap_or(0) == mss);
     }
-
     if !matches!(sig.window, WindowSpec::Any | WindowSpec::Modulo(0)) {
-        checks += 1.0;
-        matches += window_fits(observed, ip_version, sig.window) as u8 as f64;
+        check(window_fits(observed, ip_version, sig.window));
     }
-
-    // Real signatures carry a literal `scale` even when their `olayout` has
-    // no `ws` option (the Linux 2.0 entry in the vendored db is one:
-    // `mss::0` — no window-scaling option at all, yet a trailing `0`). That
-    // placeholder isn't a claim about an observed scale, so only check it
-    // when the layout actually declares a `ws` option.
-    if sig.option_layout.contains(&TcpOptionKind::WindowScale) {
-        if let Some(scale) = sig.window_scale {
-            checks += 1.0;
-            matches += (observed.window_scale == Some(scale)) as u8 as f64;
-        }
+    if let Some(scale) = sig.window_scale {
+        check(observed.window_scale.unwrap_or(0) == scale);
     }
-
     // Always checked, including an empty layout: "no options at all" is
     // itself a real, diagnostic signature (several old or minimal stacks use
     // it), not a wildcard. The padding after an EOL is part of the layout:
     // `eol+1` and `eol+3` are different stacks.
-    checks += 1.0;
-    let layout_ok =
-        observed.option_order == sig.option_layout && observed.eol_padding == sig.eol_padding;
-    matches += layout_ok as u8 as f64;
-
-    // Only `df` is currently observed among p0f's quirks — see
-    // `TcpSignature::quirks`.
-    if sig.quirks.iter().any(|q| q == "df") {
-        checks += 1.0;
-        matches += observed.df as u8 as f64;
-    }
-
+    check(observed.option_order == sig.option_layout && observed.eol_padding == sig.eol_padding);
+    check(observed.quirks == expected_quirks(sig, ip_version));
     match sig.payload_class {
-        PayloadClass::Zero => {
-            checks += 1.0;
-            matches += payload_empty as u8 as f64;
-        }
-        PayloadClass::NonZero => {
-            checks += 1.0;
-            matches += (!payload_empty) as u8 as f64;
-        }
+        PayloadClass::Zero => check(payload_empty),
+        PayloadClass::NonZero => check(!payload_empty),
         PayloadClass::Any => {}
     }
 
@@ -125,13 +93,9 @@ fn score_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &
 
 /// The observed SYN written the way p0f prints its own `raw_sig`
 /// (`ver:ittl:olen:mss:wsize,scale:olayout:quirks:pclass`), so it can be
-/// compared field by field with p0f's output and with database entries.
-///
-/// Not byte-identical to p0f everywhere, because `TcpFeatures` does not carry
-/// everything p0f looks at: IP option length is not observed and prints `?`,
-/// and `df` is the only quirk captured, so p0f's `id+`, `ecn`, `ts1-`, ...
-/// never appear. The TTL is shown as p0f does, `<initial guess>+<distance>`,
-/// and so is a window that is a whole number of segments, `mss*<n>`.
+/// compared field by field with p0f's output and with database entries. The
+/// TTL is shown as p0f does, `<initial guess>+<distance>`, and so is a window
+/// that is a whole number of segments, `mss*<n>`.
 fn raw_signature(observed: &TcpFeatures, payload_empty: bool, ip_version: u8) -> String {
     let initial = nearest_initial_ttl(observed.ttl);
     let mss = observed.mss.map_or("*".to_string(), |mss| mss.to_string());
@@ -141,11 +105,17 @@ fn raw_signature(observed: &TcpFeatures, payload_empty: bool, ip_version: u8) ->
         }
         _ => observed.window.to_string(),
     };
-    let quirks = if observed.df { "df" } else { "" };
+    let quirks = observed
+        .quirks
+        .iter()
+        .map(|&quirk| format::quirk_token(quirk))
+        .collect::<Vec<_>>()
+        .join(",");
     let pclass = if payload_empty { "0" } else { "+" };
     format!(
-        "{ip_version}:{initial}+{}:?:{mss}:{window},{}:{}:{quirks}:{pclass}",
+        "{ip_version}:{initial}+{}:{}:{mss}:{window},{}:{}:{quirks}:{pclass}",
         initial - observed.ttl,
+        observed.ip_option_len,
         observed.window_scale.unwrap_or(0),
         option_layout_text(&observed.option_order, observed.eol_padding),
     )
@@ -198,36 +168,86 @@ enum Fit {
     Mismatch,
     /// Every checked field agrees.
     Exact,
-    /// Everything identifying agrees, but TTL is out of range or an expected
-    /// DF is missing — p0f's "fuzzy" match: the same stack, seen through
-    /// something that rewrote a header on the way.
+    /// Everything identifying agrees, but TTL is out of range or the quirks
+    /// differ in a way a middlebox could explain — p0f's "fuzzy" match: the
+    /// same stack, seen through something that rewrote a header on the way.
     Fuzzy,
 }
 
-/// p0f's matching rules for one `[tcp:request]` signature. The window, MSS,
-/// scale, option layout and payload class identify a stack and must agree;
-/// only TTL and a missing DF are forgiven, and then only as a fuzzy match.
-/// Fields `TcpFeatures` does not carry (IP option length, quirks other than
-/// DF) are not checked at all.
+/// IP-level quirks IPv6 has no header field for.
+const IPV4_ONLY_QUIRKS: [TcpQuirk; 4] = [
+    TcpQuirk::Df,
+    TcpQuirk::NonZeroId,
+    TcpQuirk::ZeroId,
+    TcpQuirk::NonZeroReserved,
+];
+
+/// The quirks a signature expects on a SYN of this IP version. Most of p0f's
+/// signatures are `*` — either version — yet list `df,id+`, which only IPv4
+/// can carry. p0f would hold their absence against an IPv6 SYN as a fuzzy
+/// match; this does not, since no IPv6 SYN could ever have them.
+fn expected_quirks(sig: &TcpSignature, ip_version: u8) -> BTreeSet<TcpQuirk> {
+    sig.quirks
+        .iter()
+        .copied()
+        .filter(|quirk| ip_version != 6 || !IPV4_ONLY_QUIRKS.contains(quirk))
+        .collect()
+}
+
+/// p0f's quirk rule: identical quirks are exact. Otherwise the difference is
+/// forgiven, as a fuzzy match, only when it is something a middlebox does on
+/// its own — clearing DF (which takes `id+` with it), zeroing the ID, or
+/// setting ECN. Any other quirk gained or lost is a different stack.
+fn quirks_fit(observed: &TcpFeatures, ip_version: u8, sig: &TcpSignature) -> Fit {
+    let expected = expected_quirks(sig, ip_version);
+    let lost_ok = expected
+        .difference(&observed.quirks)
+        .all(|quirk| matches!(quirk, TcpQuirk::Df | TcpQuirk::NonZeroId));
+    let gained_ok = observed
+        .quirks
+        .difference(&expected)
+        .all(|quirk| matches!(quirk, TcpQuirk::ZeroId | TcpQuirk::Ecn));
+    if !(lost_ok && gained_ok) {
+        Fit::Mismatch
+    } else if observed.quirks == expected {
+        Fit::Exact
+    } else {
+        Fit::Fuzzy
+    }
+}
+
+/// Whether the observed TTL could have left the sender at the signature's
+/// initial TTL. A ceiling (`64-`) takes anything at or below it, since the
+/// tool randomizes under it.
+fn ttl_in_range(ttl: u8, sig: &TcpSignature) -> bool {
+    ttl <= sig.initial_ttl && (sig.ittl_is_ceiling || sig.initial_ttl - ttl <= MAX_DIST)
+}
+
+/// p0f's matching rules for one `[tcp:request]` signature (`fp_tcp.c`'s
+/// `tcp_find_match`). The option layout, IP option length, MSS, window,
+/// scale and payload class identify a stack and must agree. TTL out of range
+/// and a middlebox-shaped quirk difference are forgiven, but only as a fuzzy
+/// match. An absent MSS or window scale option counts as 0, as in p0f.
 fn fit_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &TcpSignature) -> Fit {
     if sig.ip_version.is_some_and(|expected| expected != ip_version) {
         return Fit::Mismatch;
     }
-    if sig.mss.is_some_and(|expected| observed.mss != Some(expected)) {
+    if observed.option_order != sig.option_layout || observed.eol_padding != sig.eol_padding {
         return Fit::Mismatch;
     }
-    if !window_fits(observed, ip_version, sig.window) {
+    if observed.ip_option_len != sig.ip_option_len {
         return Fit::Mismatch;
     }
-    // See `score_tcp` on why the scale only counts when the layout has `ws`.
-    if sig.option_layout.contains(&TcpOptionKind::WindowScale)
-        && sig
-            .window_scale
-            .is_some_and(|expected| observed.window_scale != Some(expected))
+    if sig.mss.is_some_and(|expected| observed.mss.unwrap_or(0) != expected) {
+        return Fit::Mismatch;
+    }
+    if sig
+        .window_scale
+        .is_some_and(|expected| observed.window_scale.unwrap_or(0) != expected)
     {
         return Fit::Mismatch;
     }
-    if observed.option_order != sig.option_layout || observed.eol_padding != sig.eol_padding {
+    if !window_fits(observed, ip_version, sig.window) {
         return Fit::Mismatch;
     }
     let payload_ok = match sig.payload_class {
@@ -239,12 +259,8 @@ fn fit_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &Tc
         return Fit::Mismatch;
     }
 
-    // DF: p0f forgives the bit disappearing (a middlebox can clear it) but not
-    // appearing where the signature has none. IPv6 has no DF bit at all —
-    // `TcpFeatures` reports it as set there — so it is not compared.
-    let sig_df = sig.quirks.iter().any(|q| q == "df");
-    let df_ok = ip_version == 6 || observed.df == sig_df;
-    if ip_version != 6 && observed.df && !sig_df {
+    let quirks = quirks_fit(observed, ip_version, sig);
+    if quirks == Fit::Mismatch {
         return Fit::Mismatch;
     }
 
@@ -253,11 +269,8 @@ fn fit_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &Tc
     if sig.ittl_is_ceiling && observed.ttl > sig.initial_ttl {
         return Fit::Mismatch;
     }
-    let ttl_ok = sig.ittl_is_ceiling
-        || (observed.ttl <= sig.initial_ttl
-            && sig.initial_ttl - observed.ttl <= MAX_PLAUSIBLE_HOPS);
 
-    if ttl_ok && df_ok {
+    if quirks == Fit::Exact && ttl_in_range(observed.ttl, sig) {
         Fit::Exact
     } else {
         Fit::Fuzzy
@@ -489,13 +502,16 @@ impl Method for F0p {
             return Ok(Outcome::NotApplicable);
         }
 
-        // The SYN — always the first observation under the direction policy,
-        // since it is what opened the session — carries everything the
-        // `[tcp:request]` signatures match on. A source with no header-level
-        // detail (a honeypot log, say) leaves `tcp` unset rather than
-        // inventing one.
+        // The SYN carries everything the `[tcp:request]` signatures match on,
+        // and only the SYN: every segment has TCP features, but an ACK or a
+        // data segment is shaped by the connection, not the stack's defaults.
+        // A session first seen mid-stream (capture started after the
+        // handshake) has no SYN, and gets no guess rather than a wrong one.
+        // A source with no header-level detail (a honeypot log, say) leaves
+        // `tcp` unset rather than inventing one.
         let Some((syn, payload_empty)) = ctx
             .observations()
+            .filter(|o| o.stage_hint == Some(Stage::Connect))
             .find_map(|o| o.tcp.as_ref().map(|tcp| (tcp, o.payload.is_empty())))
         else {
             return Ok(Outcome::NotApplicable);
@@ -617,7 +633,8 @@ mod tests {
     fn linux_syn() -> TcpFeatures {
         TcpFeatures {
             ttl: 64,
-            df: true,
+            ip_option_len: 0,
+            quirks: [TcpQuirk::Df, TcpQuirk::NonZeroId].into(),
             window: 1460 * 20,
             mss: Some(1460),
             window_scale: Some(7),
@@ -635,12 +652,15 @@ mod tests {
     }
 
     /// A real iPhone SYN, captured live:
-    /// `4:64+0:?:1460:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df:0`.
+    /// `4:64+0:0:1460:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0`.
+    /// The capture predates quirk decoding, which recorded only `df`; `id+`
+    /// is assumed, as every Apple entry in p0f's database lists it.
     fn iphone_syn() -> TcpFeatures {
         use TcpOptionKind::*;
         TcpFeatures {
             ttl: 64,
-            df: true,
+            ip_option_len: 0,
+            quirks: [TcpQuirk::Df, TcpQuirk::NonZeroId].into(),
             window: 65535,
             mss: Some(1460),
             window_scale: Some(6),
@@ -671,7 +691,7 @@ mod tests {
         observed.ttl = 61;
         assert_eq!(
             raw_signature(&observed, true, 4),
-            "4:64+3:?:1460:mss*20,7:mss,sok,ts,nop,ws:df:0"
+            "4:64+3:0:1460:mss*20,7:mss,sok,ts,nop,ws:df,id+:0"
         );
     }
 
@@ -679,7 +699,7 @@ mod tests {
     fn eol_padding_renders_as_a_byte_count() {
         assert_eq!(
             raw_signature(&iphone_syn(), true, 4),
-            "4:64+0:?:1460:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df:0"
+            "4:64+0:0:1460:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0"
         );
     }
 
@@ -809,8 +829,9 @@ mod tests {
         .remove(0);
         let mut observed = linux_syn();
         observed.window = 1024;
-        observed.df = false;
+        observed.quirks.clear();
         observed.option_order = vec![TcpOptionKind::Mss];
+        observed.window_scale = None;
         observed.ttl = 41;
         assert_eq!(fit_tcp(&observed, true, 4, &sig), Fit::Exact);
         observed.ttl = 65;
@@ -820,7 +841,7 @@ mod tests {
     #[test]
     fn df_disappearing_is_fuzzy_but_appearing_is_a_mismatch() {
         let mut no_df = linux_syn();
-        no_df.df = false;
+        no_df.quirks.clear();
         assert_eq!(fit_tcp(&no_df, true, 4, &linux_signature()), Fit::Fuzzy);
 
         let sig_without_df = format::parse(
@@ -837,8 +858,103 @@ mod tests {
     #[test]
     fn df_is_not_compared_on_ipv6() {
         let mut observed = linux_syn();
-        observed.df = false;
+        observed.quirks.clear();
         assert_eq!(fit_tcp(&observed, true, 6, &linux_signature()), Fit::Exact);
+    }
+
+    /// `df` and `id+` both disappearing is what a middlebox clearing DF looks
+    /// like; p0f still calls that the same stack, fuzzily.
+    #[test]
+    fn df_and_id_disappearing_together_is_fuzzy() {
+        let mut observed = linux_syn();
+        observed.quirks = BTreeSet::new();
+        assert_eq!(fit_tcp(&observed, true, 4, &linux_signature()), Fit::Fuzzy);
+    }
+
+    #[test]
+    fn ecn_or_a_zero_id_appearing_is_fuzzy() {
+        for gained in [TcpQuirk::Ecn, TcpQuirk::ZeroId] {
+            let mut observed = linux_syn();
+            observed.quirks.insert(gained);
+            assert_eq!(fit_tcp(&observed, true, 4, &linux_signature()), Fit::Fuzzy);
+        }
+    }
+
+    /// Anything else a stack adds or drops is the stack, not the path.
+    #[test]
+    fn any_other_quirk_difference_is_a_mismatch() {
+        let mut gained = linux_syn();
+        gained.quirks.insert(TcpQuirk::ZeroSeq);
+        assert_eq!(fit_tcp(&gained, true, 4, &linux_signature()), Fit::Mismatch);
+
+        let sig = format::parse(
+            "[tcp:request]\n\
+             label = s:unix:Test:ack+\n\
+             sig   = *:64:0:*:mss*20,7:mss,sok,ts,nop,ws:df,id+,ack+:0\n",
+        )
+        .tcp_request
+        .remove(0);
+        assert_eq!(fit_tcp(&linux_syn(), true, 4, &sig), Fit::Mismatch);
+    }
+
+    #[test]
+    fn ip_options_must_match_in_length() {
+        let mut observed = linux_syn();
+        observed.ip_option_len = 4;
+        assert_eq!(fit_tcp(&observed, true, 4, &linux_signature()), Fit::Mismatch);
+    }
+
+    #[test]
+    fn every_quirk_renders_in_the_raw_signature_in_p0f_order() {
+        let mut observed = linux_syn();
+        observed.quirks.extend([TcpQuirk::Push, TcpQuirk::ZeroSeq, TcpQuirk::Ecn]);
+        assert!(raw_signature(&observed, true, 4).ends_with(":df,id+,ecn,seq-,pushf+:0"));
+    }
+
+    fn extract_from(first: Stage) -> Outcome {
+        use std::net::Ipv4Addr;
+        use std::time::SystemTime;
+
+        use pf_core::{Endpoint, Observation, Session};
+
+        let manifest = MethodManifest::from_yaml(include_str!("../../../manifests/f0p.yaml"))
+            .expect("the shipped manifest should parse");
+        let f0p = F0p {
+            manifest,
+            db: vendored_db(),
+            min_score: 0.8,
+        };
+        let session = Session::open(Observation {
+            at: SystemTime::UNIX_EPOCH,
+            source: Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+                port: 47236,
+            },
+            destination: Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8)),
+                port: 80,
+            },
+            transport: Transport::Tcp,
+            payload: Vec::new(),
+            stage_hint: Some(first),
+            tcp: Some(linux_syn()),
+        });
+        f0p.extract(&Context::new(&session, &[], false, false)).unwrap()
+    }
+
+    #[test]
+    fn a_syn_is_fingerprinted() {
+        let Outcome::Partial(evidence) = extract_from(Stage::Connect) else {
+            panic!("a SYN should produce evidence");
+        };
+        assert!(evidence.iter().any(|e| e.key == "os"), "{evidence:?}");
+    }
+
+    /// The bug this guards: a session first seen mid-stream had its first ACK
+    /// fingerprinted as though it were the SYN.
+    #[test]
+    fn a_session_without_a_syn_is_not_fingerprinted() {
+        assert!(matches!(extract_from(Stage::Established), Outcome::NotApplicable));
     }
 
     #[test]
@@ -846,7 +962,7 @@ mod tests {
         let sig = format::parse(
             "[tcp:request]\n\
              label = s:unix:Test:mtu\n\
-             sig   = *:64:0:*:mtu*4,7:mss,sok,ts,nop,ws:df:0\n",
+             sig   = *:64:0:*:mtu*4,7:mss,sok,ts,nop,ws:df,id+:0\n",
         )
         .tcp_request
         .remove(0);
@@ -862,9 +978,9 @@ mod tests {
         let db = format::parse(
             "[tcp:request]\n\
              label = s:unix:Specific:but TTL is off\n\
-             sig   = *:128:0:*:mss*20,7:mss,sok,ts,nop,ws:df:0\n\
+             sig   = *:128:0:*:mss*20,7:mss,sok,ts,nop,ws:df,id+:0\n\
              label = g:unix:Generic:\n\
-             sig   = *:64:0:*:mss*20,*:mss,sok,ts,nop,ws:df:0\n",
+             sig   = *:64:0:*:mss*20,*:mss,sok,ts,nop,ws:df,id+:0\n",
         );
         let (sig, fit) = best_tcp_match(&db.tcp_request, &linux_syn(), true, 4).unwrap();
         assert_eq!(sig.label, "Generic");
@@ -876,9 +992,9 @@ mod tests {
         let db = format::parse(
             "[tcp:request]\n\
              label = g:unix:Generic:\n\
-             sig   = *:64:0:*:mss*20,*:mss,sok,ts,nop,ws:df:0\n\
+             sig   = *:64:0:*:mss*20,*:mss,sok,ts,nop,ws:df,id+:0\n\
              label = s:unix:Specific:\n\
-             sig   = *:64:0:*:mss*20,7:mss,sok,ts,nop,ws:df:0\n",
+             sig   = *:64:0:*:mss*20,7:mss,sok,ts,nop,ws:df,id+:0\n",
         );
         let (sig, fit) = best_tcp_match(&db.tcp_request, &linux_syn(), true, 4).unwrap();
         assert_eq!(sig.label, "Specific");
@@ -896,9 +1012,10 @@ mod tests {
         .remove(0);
         let mut observed = linux_syn();
         observed.option_order = vec![];
+        observed.window_scale = None;
         observed.window = 1024;
         observed.mss = Some(1460);
-        observed.df = false;
+        observed.quirks.clear();
         assert_eq!(fit_tcp(&observed, true, 4, &sig), Fit::Exact);
 
         let mut with_options = observed.clone();
