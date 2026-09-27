@@ -17,7 +17,7 @@ pub enum Emitted {
 /// The stage a segment's payload proves the session has reached, if any. A
 /// TLS ClientHello is its own stage, which is what `ja4`-style methods wait
 /// for; any other bytes mean application data is flowing, which is what
-/// `banner`-style methods wait for.
+/// `claimed`-style methods wait for.
 fn payload_stage(payload: &[u8]) -> Option<Stage> {
     if payload.is_empty() {
         return None;
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(stage, Stage::Established);
     }
 
-    /// What `banner` waits for: before this, no session ever reached
+    /// What `claimed` waits for: before this, no session ever reached
     /// `app-data` until it timed out.
     #[test]
     fn an_http_request_reaches_app_data() {

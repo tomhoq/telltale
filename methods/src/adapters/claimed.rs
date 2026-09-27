@@ -1,6 +1,10 @@
-//! Identifies client software from the HTTP `User-Agent` header, matched
+//! What the client *says* it is: the HTTP `User-Agent` header, matched
 //! against a hand-maintained list of known libraries, scanners, and research
 //! crawlers — exactly the traffic a honeypot's HTTP surface actually sees.
+//!
+//! Unlike `f0p` or `ja4`, nothing here fingerprints how the client behaves:
+//! any tool can send any User-Agent. The output is a claim, for `fusion` to
+//! check against the fingerprints, never a finding on its own.
 //!
 //! SSH/FTP banners are a natural future extension (the manifest's
 //! `required-stage: app-data` is already protocol-agnostic) but nothing
@@ -13,13 +17,13 @@ use serde::Deserialize;
 
 use crate::db::{self, Database};
 
-/// One `methods/db/banners.yaml` entry. A rule fires when the observed
+/// One `methods/db/user-agents.yaml` entry. A rule fires when the observed
 /// User-Agent matches *any* of its patterns — several real-world variants of
 /// the same tool often need separate patterns (e.g. ZAP's UA has changed
 /// naming across versions).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct BannerRule {
+pub struct ClaimRule {
     pub client: String,
     /// `library` | `scanner` | `crawler` | `malformed` — coarse enough to be
     /// useful to `fusion` later without pretending to know every taxonomy.
@@ -36,7 +40,7 @@ pub struct BannerRule {
     pub contains: Vec<String>,
 }
 
-impl BannerRule {
+impl ClaimRule {
     fn matches(&self, ua_lower: &str) -> bool {
         self.exact.iter().any(|p| ua_lower == p.to_ascii_lowercase())
             || self
@@ -52,12 +56,12 @@ impl BannerRule {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct BannerDb {
+pub struct ClaimDb {
     #[serde(default)]
-    pub rules: Vec<BannerRule>,
+    pub rules: Vec<ClaimRule>,
 }
 
-impl Database for BannerDb {
+impl Database for ClaimDb {
     const FORMATS: &'static [&'static str] = &["rules"];
 
     fn load(text: &str, _spec: &pf_core::DatabaseSpec) -> Result<Self> {
@@ -70,7 +74,7 @@ impl Database for BannerDb {
 /// `sqlmap/1.7#stable (http://sqlmap.org)` alike. `None` for a rule that
 /// matched only via `exact`/`contains`, where there's no unambiguous anchor
 /// to extract a version after.
-fn extract_version(user_agent: &str, ua_lower: &str, rule: &BannerRule) -> Option<String> {
+fn extract_version(user_agent: &str, ua_lower: &str, rule: &ClaimRule) -> Option<String> {
     let prefix_lower = rule
         .prefix
         .iter()
@@ -122,9 +126,9 @@ fn http_user_agent(payload: &[u8]) -> Option<String> {
     Some(String::new())
 }
 
-pub struct Banner {
+pub struct Claimed {
     manifest: MethodManifest,
-    db: BannerDb,
+    db: ClaimDb,
     /// Cap on how many bytes to scan, so a large transfer cannot make this
     /// method expensive.
     max_bytes: usize,
@@ -135,18 +139,18 @@ pub fn build(manifest: MethodManifest, manifest_dir: &Path) -> Result<Box<dyn Me
     let db = manifest
         .database
         .as_ref()
-        .map(|spec| db::load::<BannerDb>(&manifest.name, spec, manifest_dir))
+        .map(|spec| db::load::<ClaimDb>(&manifest.name, spec, manifest_dir))
         .transpose()?
         .unwrap_or_default();
 
-    Ok(Box::new(Banner {
+    Ok(Box::new(Claimed {
         manifest,
         db,
         max_bytes,
     }))
 }
 
-impl Method for Banner {
+impl Method for Claimed {
     fn manifest(&self) -> &MethodManifest {
         &self.manifest
     }
@@ -171,8 +175,8 @@ impl Method for Banner {
             return Ok(Outcome::NoMatch);
         };
 
-        // A string match here is about as certain as passive fingerprinting
-        // gets — no fuzzy scoring involved, unlike f0p's TCP signatures.
+        // Strong is confidence in reading the claim — an exact string match,
+        // no fuzzy scoring — not confidence that the claim is true.
         let mut evidence = vec![
             Evidence::new(self.name(), ctx.session.initiator, "client", rule.client.clone(), Confidence::Strong),
             Evidence::new(self.name(), ctx.session.initiator, "category", rule.category.clone(), Confidence::Strong),
@@ -198,9 +202,9 @@ impl Method for Banner {
 mod tests {
     use super::*;
 
-    fn db() -> BannerDb {
-        serde_yaml::from_str(include_str!("../../db/banners.yaml"))
-            .expect("shipped banners.yaml should parse")
+    fn db() -> ClaimDb {
+        serde_yaml::from_str(include_str!("../../db/user-agents.yaml"))
+            .expect("shipped user-agents.yaml should parse")
     }
 
     fn request(user_agent: &str) -> Vec<u8> {
@@ -208,7 +212,7 @@ mod tests {
             .into_bytes()
     }
 
-    fn identify<'a>(db: &'a BannerDb, user_agent: &str) -> Option<&'a BannerRule> {
+    fn identify<'a>(db: &'a ClaimDb, user_agent: &str) -> Option<&'a ClaimRule> {
         let ua_lower = user_agent.to_ascii_lowercase();
         db.rules.iter().find(|r| r.matches(&ua_lower))
     }
@@ -247,7 +251,7 @@ mod tests {
     #[test]
     fn a_bare_go_http_client_is_a_library_not_flagged_as_malformed() {
         // Suspicious-in-context is fusion's job (os-client-mismatch), not
-        // banner's — banner only identifies.
+        // `claimed`'s — `claimed` only reports the claim.
         let db = db();
         let rule = identify(&db, "Go-http-client/1.1").expect("Go-http-client should match");
         assert_eq!(rule.category, "library");
@@ -282,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_banners_db_parses() {
+    fn shipped_user_agents_db_parses() {
         let db = db();
         assert!(db.rules.len() > 15, "expected a real rule set, got {}", db.rules.len());
     }

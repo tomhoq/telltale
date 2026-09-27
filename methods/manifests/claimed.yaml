@@ -1,0 +1,31 @@
+name: claimed
+description: >
+  What the client says it is: the HTTP User-Agent, matched against known
+  libraries, scanners, and research crawlers. A self-reported claim that any
+  tool can spoof, not a fingerprint; weigh it against f0p/ja4.
+enabled: true
+
+required-stage: app-data
+
+invocation:
+  trigger: stage-reached
+  priority: 80
+  budget-ms: 50
+
+database:
+  path: ../db/user-agents.yaml
+  format: rules
+
+output:
+  fields:
+    - name: client
+      description: Tool or library the User-Agent claims to be, e.g. curl, sqlmap, Shodan.
+    - name: category
+      description: library | scanner | crawler | malformed (of the claimed client)
+    - name: version
+      description: Version the User-Agent claims, when the matched pattern has one to extract.
+
+params:
+  # Never scan more than this much payload; a large transfer must not make the
+  # method expensive.
+  max-bytes: 4096

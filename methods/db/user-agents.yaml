@@ -1,4 +1,4 @@
-# banner signature database — HTTP User-Agent identification.
+# `claimed` rule database — what the HTTP User-Agent says the client is.
 #
 # A rule fires when the observed User-Agent matches ANY of its `exact` /
 # `prefix` / `contains` patterns (case-insensitive). `prefix` is also the
@@ -9,8 +9,8 @@
 # malformed — enough for `fusion` to weigh later without this file
 # pretending to know every possible taxonomy. Whether a given category is
 # *suspicious in context* (e.g. a bare HTTP library hitting a page a real
-# browser would render) is fusion's call, not this file's: banner only
-# identifies what sent the request, it doesn't judge it.
+# browser would render) is fusion's call, not this file's: `claimed` only
+# records what the request says sent it; it doesn't verify or judge it.
 
 rules:
   # ---------------------------------------------------------------

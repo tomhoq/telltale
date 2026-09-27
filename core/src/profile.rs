@@ -24,7 +24,7 @@ pub enum Verdict {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
     pub verdict: Verdict,
-    /// Keyed `<method>.<key>` (`f0p.os`, `banner.client`), so each method's
+    /// Keyed `<method>.<key>` (`f0p.os`, `claimed.client`), so each method's
     /// claims stay visible side by side rather than one method's answer
     /// hiding another's. Weighing them against each other is fusion's job.
     pub attributes: HashMap<String, Attribute>,
@@ -113,11 +113,11 @@ mod tests {
     fn the_same_key_from_two_methods_is_kept_apart() {
         let mut store = ProfileStore::new();
         store.record(claim("f0p", "client", "Safari", Confidence::Likely));
-        store.record(claim("banner", "client", "curl", Confidence::Strong));
+        store.record(claim("claimed", "client", "curl", Confidence::Strong));
 
         let attributes = &store.get(&subject()).unwrap().attributes;
         assert_eq!(attributes["f0p.client"].value, "Safari");
-        assert_eq!(attributes["banner.client"].value, "curl");
+        assert_eq!(attributes["claimed.client"].value, "curl");
     }
 
     #[test]
