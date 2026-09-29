@@ -170,25 +170,27 @@ impl Method for Claimed {
             return Ok(Outcome::NoMatch);
         };
 
-        let ua_lower = user_agent.to_ascii_lowercase();
-        let Some(rule) = self.db.rules.iter().find(|r| r.matches(&ua_lower)) else {
-            return Ok(Outcome::NoMatch);
-        };
+        // The claim itself is always reported, whether or not a rule knows it:
+        // a browser's User-Agent is as much a claim as curl's, and the one
+        // fusion most needs to check against the fingerprints.
+        let subject = ctx.session.initiator;
+        let mut evidence = vec![Evidence::new(
+            self.name(),
+            subject,
+            "user-agent",
+            if user_agent.is_empty() { "(none)".to_string() } else { user_agent.clone() },
+            Confidence::Weak,
+        )];
 
-        // Strong is confidence in reading the claim — an exact string match,
-        // no fuzzy scoring — not confidence that the claim is true.
-        let mut evidence = vec![
-            Evidence::new(self.name(), ctx.session.initiator, "client", rule.client.clone(), Confidence::Strong),
-            Evidence::new(self.name(), ctx.session.initiator, "category", rule.category.clone(), Confidence::Strong),
-        ];
-        if let Some(version) = extract_version(&user_agent, &ua_lower, rule) {
-            evidence.push(Evidence::new(
-                self.name(),
-                ctx.session.initiator,
-                "version",
-                version,
-                Confidence::Strong,
-            ));
+        let ua_lower = user_agent.to_ascii_lowercase();
+        if let Some(rule) = self.db.rules.iter().find(|r| r.matches(&ua_lower)) {
+            // Weak by the spec's confidence rule: a self-reported claim is
+            // never evidence of what the client is, however exact the match.
+            evidence.push(Evidence::new(self.name(), subject, "client", rule.client.clone(), Confidence::Weak));
+            evidence.push(Evidence::new(self.name(), subject, "category", rule.category.clone(), Confidence::Weak));
+            if let Some(version) = extract_version(&user_agent, &ua_lower, rule) {
+                evidence.push(Evidence::new(self.name(), subject, "version", version, Confidence::Weak));
+            }
         }
 
         // A User-Agent match is a settled claim, not one that refines with

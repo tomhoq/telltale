@@ -43,7 +43,7 @@ impl Method for Fusion {
         // TODO: the actual scoring. Signals worth weighing, roughly in order of
         // how much they distinguish a scanner from a browser:
         //   - a ja4 hash on the known-scanner list
-        //   - a banner naming a scanning tool
+        //   - a User-Agent claiming to be a scanning tool
         //   - an OS/stack fingerprint inconsistent with the claimed client
         //   - session shape: connect-then-abandon, no app data, very short life
         //   - across sessions: many destinations from one source (needs state
