@@ -284,7 +284,12 @@ fn run(
         // In inference mode this follows the lines already printed as results
         // came in; in per-session mode it is the only report. Either way it is
         // the final tally, grouped and sorted, once the run is actually over.
-        Format::Text => print!("{}", render_text(&store)),
+        Format::Text => {
+            // Marks where the live per-update lines stop and the final table
+            // starts. JSON stays bare so it can be piped.
+            println!("\n=== end of capture: summary of {} endpoints ===", store.iter().count());
+            print!("{}", render_text(&store));
+        }
         Format::Json => print!("{}", render_json(&store)),
     }
     Ok(())
