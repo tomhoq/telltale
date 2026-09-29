@@ -38,6 +38,17 @@ tool in a runnable state, not a half-built one.
      `tokio::process::Command` with an enforced timeout. Both look identical
      from the framework's point of view. Timeouts are mandatory for (b) — one
      hung subprocess must never block the pipeline.
+   - **(a) is the default; (b) does not scale** and is reserved for two cases:
+     testing (a reference binary such as FoxIO's `ja4` CLI or `p0f` used as an
+     oracle for an in-process method), and methods that cannot reasonably
+     live in Rust (e.g. an external ML model). Any method whose features the
+     shared capture/decode layer already extracts is implemented in-process.
+   - Contract for (b): the framework hands the process the trigger event plus
+     the session so far (e.g. JSON on stdin), never raw capture access — the
+     binary must not re-decode packets on its own. Output is JSON validated
+     against the method's `output_schema`; anything else is dropped and
+     logged. Prefer one long-lived process per method over one spawn per
+     event.
 
 2. **YAML manifest per method.** Each method ships a YAML file declaring:
    - `name`, `layer` (L1/L2/L3)
@@ -46,9 +57,38 @@ tool in a runnable state, not a half-built one.
    - `output_schema`: list of `{field, type, kind}` where `kind` is one of a
      small fixed vocabulary: `classification`, `flag`, `score`,
      `raw_signature`. New methods must fit an existing `kind`; only extend the
-     `kind` vocabulary itself as a last resort.
+     `kind` vocabulary itself as a last resort. (Spelled `raw-signature` in
+     the YAML; defaults to `classification`.)
 
    The manifest is metadata/config only — never put parsing logic in YAML.
+
+   **Confidence.** Every result carries `Weak | Likely | Strong`, but it
+   only *means* something on a `classification` — a guess at what the
+   endpoint is. `raw_signature` (fingerprints, hop counts, a header as sent)
+   and `flag` values are facts about the traffic; they carry `Weak`
+   internally and renderers do not show it. Every method assigns
+   classification confidence by the same rule, not its own:
+
+   | Level    | Rule | Examples |
+   | -------- | ---- | -------- |
+   | `Strong` | Exact match to a database entry naming exactly one thing, that the entry pins completely | f0p exact match on a *specific* p0f signature; ja4t `masscan`; ja4h full-entry, single-label hit |
+   | `Likely` | Exact match that is shared or generic: a generic signature, several labels on one fingerprint, a partial entry | f0p generic "Linux 2.2.x-3.x"; ja4 "Chrome 41.0 \| … \| 45.0"; ja4h partial IcedID entry |
+   | `Weak`   | A fuzzy match (something that identifies the stack did not fit), a near miss, or anything self-reported | f0p fuzzy (TTL out of range, DF cleared); every `claimed` field |
+
+   - **Self-reported is always `Weak`.** A User-Agent (or any banner) is
+     what the client says, however exactly it matches a rule; `claimed`
+     never goes above `Weak`.
+   - **A contradiction is a flag, not a downgrade.** When two things
+     disagree (f0p's HTTP header order vs. the User-Agent), each keeps its
+     own confidence and the disagreement is its own `flag` (`f0p.ua-conflict`,
+     p0f's "dishonest"). Which side is right is fusion's call.
+   - Confidence is not a probability and not calibrated across databases:
+     a `Strong` from p0f's curated signatures and one from a single ja4db
+     row are equally "exact and unique" but not equally well-sourced.
+     Weighing sources is fusion's job (its weights), not this scale's.
+   - p0f itself has no such scale — it prints flags (`generic`, `fuzzy`,
+     `dishonest`) next to a match. The levels above are this project's
+     mapping of those flags onto one scale all methods share.
 
 3. **Single shared capture layer.** One capture component feeds all methods.
    Do not let methods each open their own capture handle. Capture sources
@@ -166,12 +206,51 @@ Key crates to use: `serde` + `serde_yaml` (manifests), `pcap` or `etherparse`
 - Exit criterion: real concurrent dispatch across multiple simultaneous
   sessions, verified with a synthetic multi-flow pcap.
 
-### Phase 3 — Real methods (start with black-box, then in-process)
-- Wrap p0f via subprocess adapter first — validates timeout handling for real
-  external tools.
+### Phase 3 — Real methods (in-process; black-box only as test oracles)
+- p0f is reimplemented in-process as `f0p` over the vendored `p0f.fp`; the
+  p0f binary is only a test oracle. The subprocess adapter's timeout handling
+  gets validated when a genuinely external method (e.g. ML) arrives.
 - Implement JA3/JA3S, HASSH in-process (hash computations over already-parsed
   fields).
-- Implement JA4 suite (JA4, JA4H at minimum). Capture HTTP fingerprinting
+- Implement JA4 suite (JA4, JA4H at minimum) in-process; FoxIO's `ja4` CLI
+  is the test oracle only (FoxIO License 1.1 covers JA4+ beyond JA4 itself —
+  fine for this non-profit research use, keep its notice).
+  - One method per fingerprint (`ja4t`, `ja4`, `ja4h`), each on its own
+    trigger, sharing helpers in `adapters/ja4_common.rs`. Each owns its own
+    ja4db export (`db/<name>_fingerprint.csv`) and labels what it knows —
+    malware included (e.g. `ja4h.client = Cobalt Strike beacon`) — under
+    `client`/`device`/`os` per the column the row filled.
+  - Lookups compare only the leading sections that identify a client
+    (manifest `match-sections`): JA4H ignores `d` (cookie values, per
+    visitor), JA4T ignores JA4TScan's retransmission timings (active only).
+    Partial entries match on the sections they have.
+  - Combinations across fingerprints belong to fusion. JA4S is the
+    honeypot's own reply, so JA4+JA4S combinations only carry their JA4
+    half here.
+- `automation`: a separate, rule-based method answering "is this automated?"
+  rather than "what is it?" — flags (`kind: flag`), one key per rule, for
+  fusion to weigh and Phase 6 to score individually. Kept out of `ja4h` so
+  JA4H stays byte-identical to FoxIO's. Candidate rules:
+  - No Accept-Language (JA4H language `0000`): not a browser — curl,
+    scripts, headless Chrome, malware beacons (every JA4H malware row in the
+    mapping has it). Means "not a browser", not "malware": crawlers and API
+    clients do it too.
+  - Cookies the honeypot never issued. A honeypot's site sets a fixed set of
+    cookie names, and browsers only return cookies for that origin, so any
+    other cookie name was crafted by the client (exploit payloads, scanners
+    probing other apps' session cookies). Compare cookie *names* (JA4H `c`)
+    against the expected set, never values (`d`: session IDs differ per
+    visitor by design). The expected set comes from config or from the
+    honeypot's own `Set-Cookie` responses (needs the responder direction).
+    No cookie on a first visit is normal and not a signal.
+  - Cookie issued but never returned by the same source: needs per-source
+    state, so it lives with the cross-session scanner layer (Phase 5).
+  - Bare or minimal SYN (no options, or MSS only, odd fixed window): the
+    stateless-scanner shape of ZMap/masscan-style tools; per-session flag
+    here, pattern across sessions in Phase 5.
+- HTTP request parsing now exists in `f0p`, `claimed` and `ja4h` (and next
+  `automation`); move it into the shared decode layer, as `TcpFeatures` is
+  for TCP, before adding a fourth copy. Capture HTTP fingerprinting
   **post-decryption, inside the honeypot process** if traffic is TLS —
   do not rely on wire-level decryption. Preserve raw header order/casing; do
   not let any intermediate component (proxy, framework) re-serialize the
@@ -181,6 +260,8 @@ Key crates to use: `serde` + `serde_yaml` (manifests), `pcap` or `etherparse`
 
 ### Phase 4 — Output modes & dashboard
 - Implement batch mode: full result dump at session finalization.
+  (Self-reported identity is its own method, `claimed` — output reads
+  `claimed.client`, never as a fingerprint.)
 - Build the dashboard/CLI output as a generic consumer keyed on `kind`
   (classification/flag/score/raw_signature) — must render a brand-new
   method's output without dashboard code changes, this is the extensibility
