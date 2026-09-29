@@ -12,8 +12,8 @@ invocation:
   budget-ms: 50
 
 database:
-  path: ../db/ja4-known.jsonl
-  format: json-lines
+  path: ../db/ja4_fingerprint.csv
+  format: ja4db-csv
 
 output:
   fields:

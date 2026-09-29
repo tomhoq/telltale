@@ -1,0 +1,33 @@
+name: ja4t
+description: >
+  JA4T TCP client fingerprint (FoxIO) from the SYN: window, option kinds in
+  order, MSS, window scale. Labels stateless scanners (masscan, ZMap, Nmap),
+  OSes and devices from the ja4t database.
+enabled: true
+
+required-stage: connect
+
+invocation:
+  trigger: stage-reached
+  priority: 95
+  budget-ms: 50
+
+database:
+  path: ../db/ja4t_fingerprint.csv
+  format: ja4db-csv
+
+output:
+  fields:
+    - name: ja4t
+      description: The JA4T fingerprint, window_options_mss_wscale.
+    - name: client
+      description: Tool or library the database names, e.g. masscan, Nmap.
+    - name: device
+      description: Device the database names, e.g. a smart-home hub.
+    - name: os
+      description: OS the database names.
+
+params:
+  # Database lookup compares the four JA4T sections. A JA4TScan entry's fifth,
+  # retransmission timings, needs an active probe and is never compared.
+  match-sections: 4

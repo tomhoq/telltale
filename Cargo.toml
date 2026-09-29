@@ -27,5 +27,7 @@ serde_yaml = "0.9"
 thiserror = "2"
 tracing = "0.1"
 serde_json = "1"
+csv = "1"
+sha2 = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pcap-file = "2.0"

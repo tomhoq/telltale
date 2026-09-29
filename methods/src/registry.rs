@@ -18,7 +18,9 @@ pub fn builtin_adapters() -> HashMap<&'static str, AdapterFactory> {
     HashMap::from([
         ("f0p", adapters::f0p::build as AdapterFactory),
         ("ja4", adapters::ja4::build as AdapterFactory),
-        ("banner", adapters::banner::build as AdapterFactory),
+        ("ja4h", adapters::ja4h::build as AdapterFactory),
+        ("ja4t", adapters::ja4t::build as AdapterFactory),
+        ("claimed", adapters::claimed::build as AdapterFactory),
         ("fusion", adapters::fusion::build as AdapterFactory),
     ])
 }
@@ -192,7 +194,7 @@ mod tests {
         assert!(!registry.is_empty(), "no methods loaded from {dir:?}");
     }
 
-    /// A SYN then a curl request: `f0p` and `banner` both have something to
+    /// A SYN then a curl request: `f0p`, `ja4t`, `ja4h` and `claimed` all have something to
     /// say, and each says it in its own emit, in priority order, rather than
     /// the two arriving together at the end of the pass.
     #[test]
@@ -255,7 +257,7 @@ mod tests {
         });
 
         let methods: Vec<&str> = emits.iter().map(|emit| emit[0].as_str()).collect();
-        assert_eq!(methods, ["f0p", "banner"]);
+        assert_eq!(methods, ["f0p", "ja4t", "ja4h", "claimed"]);
         for emit in &emits {
             assert!(emit.iter().all(|m| m == &emit[0]), "one emit mixed methods: {emit:?}");
         }

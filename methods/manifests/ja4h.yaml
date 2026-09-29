@@ -1,0 +1,33 @@
+name: ja4h
+description: >
+  JA4H HTTP client fingerprint (FoxIO) from the client's first HTTP/1.x
+  request: method, version, header order, cookies, primary language. Labels
+  the client from the ja4h database, malware included (Cobalt Strike, IcedID).
+enabled: true
+
+required-stage: app-data
+
+invocation:
+  trigger: stage-reached
+  priority: 85
+  budget-ms: 50
+
+database:
+  path: ../db/ja4h_fingerprint.csv
+  format: ja4db-csv
+
+output:
+  fields:
+    - name: ja4h
+      description: The JA4H fingerprint, a_b_c_d.
+    - name: client
+      description: Application or library the database names for this fingerprint.
+    - name: device
+      description: Device the database names for this fingerprint.
+    - name: os
+      description: OS the database names for this fingerprint.
+
+params:
+  # Database lookup compares a_b_c only. d hashes cookie values, which differ
+  # per visitor (session IDs), so no recorded entry could match anyone else.
+  match-sections: 3
