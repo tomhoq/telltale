@@ -34,14 +34,10 @@ output:
       description: The observed SYN in p0f's raw_sig notation (ver:ittl:olen:mss:wsize,scale:olayout:quirks:pclass), for comparing against p0f and its database.
     - name: distance
       kind: raw-signature
-      description: Estimated hop count, from the gap between the observed TTL and its nearest common initial value.
+      description: Estimated hop count, the gap between the observed TTL and the initial TTL it left with (the matched signature's when the TTL fits it, else the nearest of 32, 64, 128 or 255 above it).
     - name: client
-      description: HTTP client/tool, from the header order; Weak when the User-Agent claims something else.
-    - name: nearest
-      description: When no signature matches, the one sharing the most fields with the SYN. A near miss, not a classification — always Weak.
+      description: HTTP client/tool, from the header order. Strong on a specific signature, Likely on a generic one.
+    - name: ua-conflict
+      kind: flag
+      description: Set when the User-Agent lacks the substring the matched HTTP signature expects (p0f's "dishonest"). Says the claim and the headers disagree, not which is right.
 
-params:
-  # Matching follows p0f: window, MSS, scale, option layout and payload class
-  # must agree exactly. This only decides when a near miss is worth reporting
-  # as `nearest`: the share of signature fields it has to agree on.
-  min-score: 0.8

@@ -51,9 +51,21 @@ fn nearest_initial_ttl(observed: u8) -> u8 {
         .unwrap_or(255)
 }
 
+/// The initial TTL the hop count is measured from. The matched signature's
+/// own, when the observed TTL fits it; otherwise the nearest common initial
+/// value above the observed TTL. A fuzzy match whose TTL does not fit (a
+/// TTL of 48 matched to a 128 Windows signature) would claim 80 hops — no
+/// real path is that long, so that signature's TTL is not used.
+fn distance_base(ttl: u8, matched: Option<&TcpSignature>) -> u8 {
+    matched
+        .filter(|sig| ttl_in_range(ttl, sig))
+        .map(|sig| sig.initial_ttl)
+        .unwrap_or_else(|| nearest_initial_ttl(ttl))
+}
+
 /// Share of the checked fields that agree, every field counting the same.
 /// Not a match test — [`fit_tcp`] is — only a measure of how close a
-/// signature came, for reporting the nearest one when nothing matched.
+/// signature came, for logging the nearest one when nothing matched.
 fn score_tcp(observed: &TcpFeatures, payload_empty: bool, ip_version: u8, sig: &TcpSignature) -> f64 {
     let mut checks = 0.0_f64;
     let mut matches = 0.0_f64;
@@ -432,9 +444,11 @@ fn http_fits(observed: &ObservedHttpRequest, sig: &HttpSignature) -> bool {
             .all(|absent| observed.header_value(absent).is_none())
 }
 
-/// Whether the User-Agent claims the software the headers look like. p0f does
-/// not reject a match over this; it flags the client as dishonest — a tool
-/// that sets a browser's User-Agent but not its header order, say.
+/// Whether the User-Agent contains the signature's expected-software
+/// substring (its `expsw` field, e.g. `Firefox/` or `curl/` — not the label,
+/// which is free text). p0f does not reject a match over this; it flags the
+/// client as dishonest — a tool that sets a browser's User-Agent but not its
+/// header order, say. So does `f0p`: see `ua-conflict`.
 fn software_agrees(observed: &ObservedHttpRequest, sig: &HttpSignature) -> bool {
     let Some(expected) = &sig.expected_software else {
         return true;
@@ -462,22 +476,24 @@ fn best_http_match<'a>(
     generic
 }
 
-fn http_confidence(observed: &ObservedHttpRequest, sig: &HttpSignature) -> Confidence {
-    match (sig.specific, software_agrees(observed, sig)) {
-        (_, false) => Confidence::Weak,
-        (true, true) => Confidence::Strong,
-        (false, true) => Confidence::Likely,
+/// How sure the header-order match is, by the spec's confidence rule: a
+/// specific signature is Strong, a generic one Likely. The User-Agent does
+/// not lower it — a disagreeing one is reported as its own `ua-conflict`
+/// flag, since the headers may well be right and the claim wrong.
+fn http_confidence(sig: &HttpSignature) -> Confidence {
+    if sig.specific {
+        Confidence::Strong
+    } else {
+        Confidence::Likely
     }
 }
 
 pub struct F0p {
     manifest: MethodManifest,
     db: P0fDb,
-    min_score: f64,
 }
 
 pub fn build(manifest: MethodManifest, manifest_dir: &Path) -> Result<Box<dyn Method>> {
-    let min_score = manifest.param("min-score", 0.8);
     let db = manifest
         .database
         .as_ref()
@@ -485,11 +501,7 @@ pub fn build(manifest: MethodManifest, manifest_dir: &Path) -> Result<Box<dyn Me
         .transpose()?
         .unwrap_or_default();
 
-    Ok(Box::new(F0p {
-        manifest,
-        db,
-        min_score,
-    }))
+    Ok(Box::new(F0p { manifest, db }))
 }
 
 impl Method for F0p {
@@ -538,6 +550,9 @@ impl Method for F0p {
                 ?fit,
                 "f0p tcp match"
             ),
+            // The nearest signature goes to the log only, for spotting gaps
+            // in the database: a near miss can differ in exactly the field
+            // that identifies the stack, so it is never reported as a result.
             None => {
                 let nearest = nearest_tcp_signature(&self.db.tcp_request, syn, payload_empty, ip_version);
                 tracing::debug!(
@@ -548,17 +563,6 @@ impl Method for F0p {
                     nearest_score = nearest.map(|(_, score)| score),
                     "f0p tcp: no signature matches"
                 );
-                // Visible, but under its own key and never above Weak, so a
-                // near miss cannot be read as a classification.
-                if let Some((sig, _)) = nearest.filter(|(_, score)| *score >= self.min_score) {
-                    evidence.push(Evidence::new(
-                        self.name(),
-                        ctx.session.initiator,
-                        "nearest",
-                        sig.label.clone(),
-                        Confidence::Weak,
-                    ));
-                }
             }
         }
         evidence.push(Evidence::new(
@@ -569,13 +573,7 @@ impl Method for F0p {
             Confidence::Weak,
         ));
 
-        // The hop-count estimate needs no signature match at all — it falls
-        // out of the observed TTL either way. A match gives the sender's
-        // actual intended initial TTL, which is more precise than the
-        // fallback guess at the nearest common value.
-        let initial_ttl = best_tcp
-            .map(|(sig, _)| sig.initial_ttl)
-            .unwrap_or_else(|| nearest_initial_ttl(syn.ttl));
+        let initial_ttl = distance_base(syn.ttl, best_tcp.map(|(sig, _)| sig));
         evidence.push(Evidence::new(
             self.name(),
             ctx.session.initiator,
@@ -613,8 +611,18 @@ impl Method for F0p {
                     ctx.session.initiator,
                     "client",
                     sig.label.clone(),
-                    http_confidence(&request, sig),
+                    http_confidence(sig),
                 ));
+                if !software_agrees(&request, sig) {
+                    let expected = sig.expected_software.as_deref().unwrap_or_default();
+                    evidence.push(Evidence::new(
+                        self.name(),
+                        ctx.session.initiator,
+                        "ua-conflict",
+                        format!("headers look like {}, User-Agent lacks \"{expected}\"", sig.label),
+                        Confidence::Strong,
+                    ));
+                }
             }
         }
 
@@ -816,6 +824,22 @@ mod tests {
         assert_eq!(fit_tcp(&observed, true, 4, &linux_signature()), Fit::Fuzzy);
     }
 
+    /// The bug this guards: a TTL of 48 fuzzily matched to a Windows (128)
+    /// signature reported a distance of 80.
+    #[test]
+    fn distance_ignores_a_signature_ttl_the_observed_one_does_not_fit() {
+        let windows = format::parse(
+            "[tcp:request]\n\
+             label = s:win:Windows:NT kernel 5.x\n\
+             sig   = *:128:0:*:65535,8:mss,nop,ws,nop,nop,sok:df,id+:0\n",
+        )
+        .tcp_request
+        .remove(0);
+        assert_eq!(distance_base(48, Some(&windows)), 64);
+        assert_eq!(distance_base(120, Some(&windows)), 128);
+        assert_eq!(distance_base(48, None), 64);
+    }
+
     /// A ceiling (`64-`) is different: the tool randomizes under it, so a TTL
     /// above it is a different tool.
     #[test]
@@ -922,7 +946,6 @@ mod tests {
         let f0p = F0p {
             manifest,
             db: vendored_db(),
-            min_score: 0.8,
         };
         let session = Session::open(Observation {
             at: SystemTime::UNIX_EPOCH,
@@ -1054,13 +1077,15 @@ mod tests {
         .unwrap();
         let sig = best_http_match(&db.http_request, &request).expect("curl should match");
         assert_eq!(sig.label, "curl");
-        assert_eq!(http_confidence(&request, sig), Confidence::Strong);
+        assert_eq!(http_confidence(sig), Confidence::Strong);
+        assert!(software_agrees(&request, sig));
     }
 
     /// p0f flags this rather than rejecting it: the headers are curl's, the
-    /// User-Agent claims a browser. Still a match, but only Weak.
+    /// User-Agent claims a browser. Still a full-confidence match on the
+    /// headers; the disagreement is a separate `ua-conflict` flag.
     #[test]
-    fn a_user_agent_that_disagrees_with_the_headers_is_weak_not_rejected() {
+    fn a_user_agent_that_disagrees_with_the_headers_is_flagged_not_weakened() {
         let db = format::parse(
             "[http:request]\n\
              label = s:!:curl:\n\
@@ -1071,7 +1096,8 @@ mod tests {
         )
         .unwrap();
         let sig = best_http_match(&db.http_request, &request).expect("the headers still fit curl");
-        assert_eq!(http_confidence(&request, sig), Confidence::Weak);
+        assert_eq!(http_confidence(sig), Confidence::Strong);
+        assert!(!software_agrees(&request, sig));
     }
 
     #[test]
