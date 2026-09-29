@@ -15,7 +15,7 @@ pub mod profile;
 pub mod session;
 
 pub use error::{Error, Result};
-pub use evidence::{Confidence, Evidence};
+pub use evidence::{Confidence, Evidence, FieldKind};
 pub use manifest::{DatabaseSpec, Invocation, MethodManifest, OutputSchema, Trigger};
 pub use method::{Context, Method, Outcome};
 pub use observation::{

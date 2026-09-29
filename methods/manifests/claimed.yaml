@@ -19,6 +19,7 @@ database:
 output:
   fields:
     - name: user-agent
+      kind: raw-signature
       description: The User-Agent exactly as sent, "(none)" when missing. Always reported.
     - name: client
       description: Tool or library the User-Agent claims to be, e.g. curl, sqlmap, Shodan.

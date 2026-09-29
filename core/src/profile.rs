@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::evidence::{Confidence, Evidence};
+use crate::evidence::{Confidence, Evidence, FieldKind};
 use crate::observation::Endpoint;
 /* Profile.rs
 
@@ -35,6 +35,7 @@ pub struct Profile {
 pub struct Attribute {
     pub value: String,
     pub confidence: Confidence,
+    pub kind: FieldKind,
     pub method: String,
 }
 
@@ -71,6 +72,7 @@ impl ProfileStore {
                 Attribute {
                     value: evidence.value.clone(),
                     confidence: evidence.confidence,
+                    kind: evidence.kind,
                     method: evidence.method.clone(),
                 },
             );

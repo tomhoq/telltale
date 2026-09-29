@@ -19,6 +19,7 @@ database:
 output:
   fields:
     - name: ja4t
+      kind: raw-signature
       description: The JA4T fingerprint, window_options_mss_wscale.
     - name: client
       description: Tool or library the database names, e.g. masscan, Nmap.

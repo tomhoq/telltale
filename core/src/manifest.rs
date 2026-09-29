@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::evidence::FieldKind;
 use crate::session::Stage;
 
 /// One `methods/manifests/*.yaml` file.
@@ -102,6 +103,14 @@ impl OutputSchema {
     pub fn declares(&self, key: &str) -> bool {
         self.fields.iter().any(|f| f.name == key)
     }
+
+    /// The declared kind of `key`; `classification` for an undeclared one.
+    pub fn kind_of(&self, key: &str) -> FieldKind {
+        self.fields
+            .iter()
+            .find(|f| f.name == key)
+            .map_or(FieldKind::default(), |f| f.kind)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +119,9 @@ pub struct FieldSpec {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// `classification` (default), `flag`, `score` or `raw-signature`.
+    #[serde(default)]
+    pub kind: FieldKind,
 }
 
 fn default_true() -> bool {

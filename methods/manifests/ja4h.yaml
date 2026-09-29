@@ -19,6 +19,7 @@ database:
 output:
   fields:
     - name: ja4h
+      kind: raw-signature
       description: The JA4H fingerprint, a_b_c_d.
     - name: client
       description: Application or library the database names for this fingerprint.

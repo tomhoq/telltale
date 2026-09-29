@@ -170,6 +170,7 @@ impl Registry {
                     );
                     continue;
                 }
+                item.kind = manifest.output.kind_of(&item.key);
                 item.provisional = provisional;
                 evidence.push(item);
             }

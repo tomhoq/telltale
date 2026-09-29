@@ -4,7 +4,7 @@
 //! this gets called repeatedly on a store that is still filling up. That is why
 //! provisional evidence is marked rather than hidden.
 
-use pf_core::{Profile, ProfileStore, Verdict};
+use pf_core::{FieldKind, Profile, ProfileStore, Verdict};
 
 pub fn render_text(store: &ProfileStore) -> String {
     let mut out = String::new();
@@ -34,10 +34,16 @@ pub fn render_text(store: &ProfileStore) -> String {
         attributes.sort_by_key(|(key, _)| key.as_str());
         // The key already names the method (`f0p.os`).
         for (key, attribute) in attributes {
-            out.push_str(&format!(
-                "  {key:<20} {} ({:?})\n",
-                attribute.value, attribute.confidence
-            ));
+            // Only a classification is a guess with a confidence (see the
+            // spec's confidence rule). A raw value (fingerprint, hop count,
+            // header as sent) or a flag is a fact about the traffic.
+            match attribute.kind {
+                FieldKind::Classification => out.push_str(&format!(
+                    "  {key:<20} {} ({:?})\n",
+                    attribute.value, attribute.confidence
+                )),
+                _ => out.push_str(&format!("  {key:<20} {}\n", attribute.value)),
+            }
         }
     }
 
