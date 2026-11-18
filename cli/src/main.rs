@@ -8,13 +8,14 @@ mod pick;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use pf_capture::sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};
 use pf_capture::Source;
 use pf_core::{attribute_key, Endpoint, Evidence, Observation, Session};
 use pf_dispatch::{Assembler, Dispatcher, Emitted, Job};
-use pf_methods::Registry;
+use pf_methods::{MethodTiming, Registry};
 use pf_output::{render_json, render_line, render_text, BatchConsumer, InferenceConsumer};
 
 use crate::config::{OutputMode, PipelineConfig};
@@ -67,6 +68,12 @@ struct Cli {
     /// never mix with `--format json` on stdout.
     #[arg(long, global = true)]
     debug: bool,
+
+    /// After the run, print how long each method spent processing: per run
+    /// of the method and averaged over every packet read. Build with
+    /// `--release` for numbers that mean anything.
+    #[arg(long, global = true)]
+    timings: bool,
 }
 
 #[derive(Subcommand)]
@@ -180,7 +187,7 @@ fn main() -> pf_core::Result<()> {
     };
 
     tracing::info!(source = %source.describe(), mode = ?config.output, "starting");
-    run(source.as_mut(), registry, &config, cli.format)
+    run(source.as_mut(), registry, &config, cli.format, cli.timings)
 }
 
 fn run(
@@ -188,6 +195,7 @@ fn run(
     registry: Registry,
     config: &PipelineConfig,
     format: Format,
+    timings: bool,
 ) -> pf_core::Result<()> {
     // pf-dispatch is generic over "a thing that turns a session into
     // evidence" — the registry, and the direction policy it needs to apply
@@ -246,7 +254,9 @@ fn run(
         })
     });
 
+    let mut packets: u64 = 0;
     while let Some(observation) = source.next_observation()? {
+        packets += 1;
         let now = observation.at;
         log_observation(&observation);
 
@@ -292,7 +302,55 @@ fn run(
         }
         Format::Json => print!("{}", render_json(&store)),
     }
+    if timings {
+        let table = render_timings(&registry.timings(), packets);
+        // Never inside JSON on stdout.
+        match format {
+            Format::Text => print!("{table}"),
+            Format::Json => eprint!("{table}"),
+        }
+    }
     Ok(())
+}
+
+/// Per method: how often it ran, its average time per run, and its total
+/// time spread over every packet read — the cost each packet carries for
+/// that method, whether or not it ran on that packet.
+fn render_timings(timings: &[MethodTiming], packets: u64) -> String {
+    let micros = |d: Duration| d.as_secs_f64() * 1e6;
+    let mut out = format!(
+        "
+=== method timings over {packets} packets ===
+{:<10} {:>9} {:>12} {:>14} {:>16}
+",
+        "method", "runs", "total ms", "avg/run µs", "avg/packet µs"
+    );
+    let mut total = Duration::ZERO;
+    for timing in timings {
+        total += timing.total;
+        let per_run = if timing.runs == 0 { 0.0 } else { micros(timing.total) / timing.runs as f64 };
+        let per_packet = if packets == 0 { 0.0 } else { micros(timing.total) / packets as f64 };
+        out.push_str(&format!(
+            "{:<10} {:>9} {:>12.3} {:>14.3} {:>16.3}
+",
+            timing.name,
+            timing.runs,
+            timing.total.as_secs_f64() * 1e3,
+            per_run,
+            per_packet
+        ));
+    }
+    let per_packet = if packets == 0 { 0.0 } else { micros(total) / packets as f64 };
+    out.push_str(&format!(
+        "{:<10} {:>9} {:>12.3} {:>14} {:>16.3}
+",
+        "all",
+        "",
+        total.as_secs_f64() * 1e3,
+        "",
+        per_packet
+    ));
+    out
 }
 
 fn submit(dispatcher: &Dispatcher, session: Session, is_final: bool) {

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use pf_core::{
     Context, Error, Evidence, Method, MethodManifest, Outcome, Result, Session, Trigger,
@@ -29,6 +31,25 @@ pub fn builtin_adapters() -> HashMap<&'static str, AdapterFactory> {
 /// fusion (low priority) sees the evidence it combines.
 pub struct Registry {
     methods: Vec<Box<dyn Method>>,
+    /// One per method, same order. Atomics because workers run sessions on
+    /// several threads at once.
+    timings: Vec<Timing>,
+}
+
+#[derive(Default)]
+struct Timing {
+    runs: AtomicU64,
+    nanos: AtomicU64,
+}
+
+/// Time spent inside one method's `extract`, over the whole run.
+#[derive(Debug, Clone)]
+pub struct MethodTiming {
+    pub name: String,
+    /// How many times `extract` was called (it is skipped while the
+    /// session has not reached the method's stage).
+    pub runs: u64,
+    pub total: Duration,
 }
 
 impl Registry {
@@ -68,11 +89,25 @@ impl Registry {
         }
 
         methods.sort_by_key(|m| -m.manifest().invocation.priority);
-        Ok(Self { methods })
+        Ok(Self::new(methods))
     }
 
     pub fn new(methods: Vec<Box<dyn Method>>) -> Self {
-        Self { methods }
+        let timings = methods.iter().map(|_| Timing::default()).collect();
+        Self { methods, timings }
+    }
+
+    /// Per-method time spent in `extract` so far, in run order.
+    pub fn timings(&self) -> Vec<MethodTiming> {
+        self.methods
+            .iter()
+            .zip(&self.timings)
+            .map(|(method, timing)| MethodTiming {
+                name: method.name().to_string(),
+                runs: timing.runs.load(Ordering::Relaxed),
+                total: Duration::from_nanos(timing.nanos.load(Ordering::Relaxed)),
+            })
+            .collect()
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -122,7 +157,7 @@ impl Registry {
     ) {
         let mut evidence: Vec<Evidence> = Vec::new();
 
-        for method in &self.methods {
+        for (method, timing) in self.methods.iter().zip(&self.timings) {
             let manifest = method.manifest();
 
             let should_run = match manifest.invocation.trigger {
@@ -147,7 +182,13 @@ impl Registry {
             // stall its worker.
             let outcome = {
                 let ctx = Context::new(session, &evidence, final_pass, both_directions);
-                match method.extract(&ctx) {
+                let started = Instant::now();
+                let result = method.extract(&ctx);
+                timing.runs.fetch_add(1, Ordering::Relaxed);
+                timing
+                    .nanos
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                match result {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         // One broken method must not sink the whole session.
