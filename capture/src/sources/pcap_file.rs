@@ -1,10 +1,10 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use pcap_file::pcap::PcapReader;
-use pcap_file::DataLink;
+use pcap_file::{DataLink, TsResolution};
 use pf_core::{Error, Observation, Result};
 
 use crate::{decode, Source};
@@ -15,6 +15,7 @@ pub struct PcapFileSource {
     path: PathBuf,
     reader: PcapReader<BufReader<File>>,
     datalink: DataLink,
+    nanosecond_timestamps: bool,
 }
 
 impl PcapFileSource {
@@ -30,11 +31,13 @@ impl PcapFileSource {
         let pcap_reader = PcapReader::new(reader)
             .map_err(|e| Error::Capture(format!("failed to parse pcap header in `{}`: {e}", path.display())))?;
         let datalink = pcap_reader.header().datalink;
+        let nanosecond_timestamps = pcap_reader.header().ts_resolution == TsResolution::NanoSecond;
 
         Ok(Self {
             path,
             reader: pcap_reader,
             datalink,
+            nanosecond_timestamps,
         })
     }
 }
@@ -45,7 +48,11 @@ impl Source for PcapFileSource {
     }
 
     fn next_observation(&mut self) -> Result<Option<Observation>> {
-        while let Some(packet_result) = self.reader.next_packet() {
+        // Raw packets: `next_packet` rejects any packet longer on the wire than
+        // the snaplen, which is every truncated packet of a snaplen-limited
+        // capture (MAWI's 96 bytes). The headers fit in the snaplen; that is
+        // all decoding needs.
+        while let Some(packet_result) = self.reader.next_raw_packet() {
             let packet = packet_result.map_err(|e| {
                 Error::Capture(format!(
                     "error reading packet from `{}`: {e}",
@@ -56,7 +63,12 @@ impl Source for PcapFileSource {
             // Replay must use the packet's own timestamp rather than wall clock,
             // otherwise the session assembler's inactivity timeout will expire
             // everything at once.
-            let at = SystemTime::UNIX_EPOCH + packet.timestamp;
+            let frac = if self.nanosecond_timestamps {
+                packet.ts_frac
+            } else {
+                packet.ts_frac.saturating_mul(1000)
+            };
+            let at = SystemTime::UNIX_EPOCH + Duration::new(packet.ts_sec.into(), frac.min(999_999_999));
 
             let observation = match self.datalink {
                 DataLink::ETHERNET => decode::ethernet_frame(&packet.data, at),
@@ -98,8 +110,7 @@ impl Source for PcapFileSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use pcap_file::pcap::{PcapPacket, PcapWriter};
+    use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter};
     use pf_core::{Stage, Transport};
 
     fn make_ethernet_ip_tcp(src_port: u16, dst_port: u16) -> Vec<u8> {
@@ -170,6 +181,31 @@ mod tests {
         assert_eq!(obs2.source.port, 45678);
         assert_eq!(obs2.destination.port, 443);
 
+        assert!(source.next_observation().unwrap().is_none());
+
+        let _ = std::fs::remove_file(&pcap_path);
+    }
+
+    /// A snaplen-limited capture: the packet is cut short of its length on the
+    /// wire, and is still decoded from the headers that were kept.
+    #[test]
+    fn replays_packets_truncated_by_the_snaplen() {
+        let pcap_path = std::env::temp_dir().join(format!("test_snaplen_{}.pcap", std::process::id()));
+        let frame = make_ethernet_ip_tcp(45678, 80);
+        let header = PcapHeader {
+            snaplen: frame.len() as u32,
+            ..Default::default()
+        };
+        let mut pcap_writer = PcapWriter::with_header(File::create(&pcap_path).unwrap(), header).unwrap();
+        pcap_writer
+            .write_packet(&PcapPacket::new(Duration::new(100, 250_000), 1500, &frame))
+            .unwrap();
+        drop(pcap_writer);
+
+        let mut source = PcapFileSource::open(&pcap_path).unwrap();
+        let obs = source.next_observation().unwrap().expect("the truncated packet should decode");
+        assert_eq!(obs.at, SystemTime::UNIX_EPOCH + Duration::new(100, 250_000));
+        assert_eq!(obs.destination.port, 80);
         assert!(source.next_observation().unwrap().is_none());
 
         let _ = std::fs::remove_file(&pcap_path);
