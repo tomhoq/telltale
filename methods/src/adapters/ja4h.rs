@@ -28,6 +28,7 @@ use std::path::Path;
 
 use pf_core::{Confidence, Context, Evidence, Method, MethodManifest, Outcome, Result};
 
+use super::http_request::{first_request, FirstRequest};
 use super::ja4_common::{hash12, label_evidence, match_sections, Ja4hDb};
 use crate::db;
 
@@ -183,6 +184,8 @@ pub struct Ja4h {
     /// cookie values, which differ per visitor (session IDs), so no database
     /// entry could match it for anyone but the visitor it was recorded from.
     sections: usize,
+    /// Cap on how much of the client's stream is read for the request head.
+    max_bytes: usize,
 }
 
 pub fn build(manifest: MethodManifest, manifest_dir: &Path) -> Result<Box<dyn Method>> {
@@ -193,7 +196,13 @@ pub fn build(manifest: MethodManifest, manifest_dir: &Path) -> Result<Box<dyn Me
         .transpose()?
         .unwrap_or_default();
     let sections = match_sections(&manifest, 3);
-    Ok(Box::new(Ja4h { manifest, db, sections }))
+    let max_bytes = manifest.param("max-bytes", 16384);
+    Ok(Box::new(Ja4h {
+        manifest,
+        db,
+        sections,
+        max_bytes,
+    }))
 }
 
 impl Method for Ja4h {
@@ -202,8 +211,17 @@ impl Method for Ja4h {
     }
 
     fn extract(&self, ctx: &Context<'_>) -> Result<Outcome> {
-        let Some(request) = ctx.observations().find_map(|o| Request::parse(&o.payload)) else {
-            return Ok(Outcome::NoMatch);
+        let head = match first_request(ctx, self.max_bytes) {
+            FirstRequest::Nothing | FirstRequest::Incomplete => return Ok(Outcome::NoMatch),
+            // Not HTTP from its first bytes (SSH, TLS, ...): no request will
+            // come, so done rather than looked at again on every packet.
+            FirstRequest::NotHttp => return Ok(Outcome::Complete(Vec::new())),
+            FirstRequest::Head(head) => head,
+        };
+        // A head cut off by the byte cap or the session's end does not parse
+        // (see `Request::parse`): no fingerprint rather than a wrong one.
+        let Some(request) = Request::parse(&head) else {
+            return Ok(Outcome::Complete(Vec::new()));
         };
         let ja4h = request.fingerprint();
 
@@ -295,5 +313,44 @@ mod tests {
         assert!(Request::parse(b"GET / HTTP/1.1\r\nHost: honeypot\r\n").is_none());
         assert!(Request::parse(b"\x16\x03\x01\x00\xa5").is_none());
         assert!(Request::parse(b"FOO / HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    // ------------------------------------------------ on a session
+
+    fn shipped() -> Box<dyn Method> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("manifests");
+        let manifest = MethodManifest::from_yaml(&std::fs::read_to_string(dir.join("ja4h.yaml")).unwrap()).unwrap();
+        build(manifest, &dir).unwrap()
+    }
+
+    fn run(packets: &[(bool, &[u8])], is_final: bool) -> Outcome {
+        let session = crate::adapters::http_request::test_support::session(packets);
+        shipped().extract(&Context::new(&session, &[], is_final, false)).unwrap()
+    }
+
+    fn keys(outcome: &Outcome) -> Vec<&str> {
+        outcome.evidence().iter().map(|e| e.key.as_str()).collect()
+    }
+
+    /// SSH, TLS: done from the first bytes with nothing to say, so the
+    /// registry stops invoking it instead of rescanning every later packet.
+    #[test]
+    fn a_connection_that_is_not_http_is_done_at_once() {
+        let get = b"GET / HTTP/1.1\r\nUser-Agent: curl/8.5.0\r\n\r\n";
+        for first in [b"SSH-2.0-OpenSSH_9.6\r\n".as_slice(), &[0x16, 0x03, 0x01, 0x02, 0x00]] {
+            let outcome = run(&[(true, first), (true, get)], false);
+            assert!(matches!(&outcome, Outcome::Complete(e) if e.is_empty()), "{outcome:?}");
+        }
+    }
+
+    /// A request head over two segments: waits for the second, then reads it whole.
+    #[test]
+    fn a_request_split_over_segments_is_read_whole() {
+        let head = b"GET / HTTP/1.1\r\nHost: honeypot\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n";
+        let (a, b) = head.split_at(30);
+        assert!(matches!(run(&[(true, a)], false), Outcome::NoMatch));
+        let outcome = run(&[(true, a), (true, b)], false);
+        assert!(matches!(outcome, Outcome::Complete(_)), "{outcome:?}");
+        assert!(keys(&outcome).contains(&"ja4h"), "{outcome:?}");
     }
 }

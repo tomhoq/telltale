@@ -15,6 +15,7 @@ use std::path::Path;
 use pf_core::{Confidence, Context, Evidence, Method, MethodManifest, Outcome, Result};
 use serde::Deserialize;
 
+use super::http_request::{first_request, FirstRequest};
 use crate::db::{self, Database};
 
 /// One `methods/db/user-agents.yaml` entry. A rule fires when the observed
@@ -156,18 +157,17 @@ impl Method for Claimed {
     }
 
     fn extract(&self, ctx: &Context<'_>) -> Result<Outcome> {
-        let scanned: usize = ctx
-            .observations()
-            .map(|o| o.payload.len())
-            .take_while(|len| *len <= self.max_bytes)
-            .sum();
-
-        if scanned == 0 {
-            return Ok(Outcome::NotApplicable);
-        }
-
-        let Some(user_agent) = ctx.observations().find_map(|o| http_user_agent(&o.payload)) else {
-            return Ok(Outcome::NoMatch);
+        let head = match first_request(ctx, self.max_bytes) {
+            FirstRequest::Nothing => return Ok(Outcome::NotApplicable),
+            FirstRequest::Incomplete => return Ok(Outcome::NoMatch),
+            // Not HTTP from its first bytes (SSH, TLS, ...): nothing to
+            // claim, now or later, so done rather than looked at again on
+            // every packet.
+            FirstRequest::NotHttp => return Ok(Outcome::Complete(Vec::new())),
+            FirstRequest::Head(head) => head,
+        };
+        let Some(user_agent) = http_user_agent(&head) else {
+            return Ok(Outcome::Complete(Vec::new()));
         };
 
         // The claim itself is always reported, whether or not a rule knows it:
@@ -291,5 +291,44 @@ mod tests {
     fn shipped_user_agents_db_parses() {
         let db = db();
         assert!(db.rules.len() > 15, "expected a real rule set, got {}", db.rules.len());
+    }
+
+    // ------------------------------------------------ on a session
+
+    fn shipped() -> Box<dyn Method> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("manifests");
+        let manifest = MethodManifest::from_yaml(&std::fs::read_to_string(dir.join("claimed.yaml")).unwrap()).unwrap();
+        build(manifest, &dir).unwrap()
+    }
+
+    fn run(packets: &[(bool, &[u8])], is_final: bool) -> Outcome {
+        let session = crate::adapters::http_request::test_support::session(packets);
+        shipped().extract(&Context::new(&session, &[], is_final, false)).unwrap()
+    }
+
+    fn keys(outcome: &Outcome) -> Vec<&str> {
+        outcome.evidence().iter().map(|e| e.key.as_str()).collect()
+    }
+
+    /// SSH, TLS: done from the first bytes with nothing to say, so the
+    /// registry stops invoking it instead of rescanning every later packet.
+    #[test]
+    fn a_connection_that_is_not_http_is_done_at_once() {
+        let get = b"GET / HTTP/1.1\r\nUser-Agent: curl/8.5.0\r\n\r\n";
+        for first in [b"SSH-2.0-OpenSSH_9.6\r\n".as_slice(), &[0x16, 0x03, 0x01, 0x02, 0x00]] {
+            let outcome = run(&[(true, first), (true, get)], false);
+            assert!(matches!(&outcome, Outcome::Complete(e) if e.is_empty()), "{outcome:?}");
+        }
+    }
+
+    /// A request head over two segments: waits for the second, then reads it whole.
+    #[test]
+    fn a_request_split_over_segments_is_read_whole() {
+        let head = b"GET / HTTP/1.1\r\nHost: honeypot\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n";
+        let (a, b) = head.split_at(30);
+        assert!(matches!(run(&[(true, a)], false), Outcome::NoMatch));
+        let outcome = run(&[(true, a), (true, b)], false);
+        assert!(matches!(outcome, Outcome::Complete(_)), "{outcome:?}");
+        assert!(keys(&outcome).contains(&"client"), "{outcome:?}");
     }
 }
