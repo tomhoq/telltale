@@ -10,13 +10,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use pf_capture::sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};
 use pf_capture::Source;
 use pf_core::{attribute_key, Endpoint, Evidence, Observation, Session};
 use pf_dispatch::{Assembler, Dispatcher, Emitted, Job};
 use pf_methods::{MethodTiming, Registry};
-use pf_output::{render_json, render_line, render_text, BatchConsumer, InferenceConsumer};
+use pf_output::{
+    render_json, render_line, render_pretty, render_pretty_block, render_text, BatchConsumer, InferenceConsumer,
+};
 
 use crate::config::{OutputMode, PipelineConfig};
 
@@ -36,6 +38,13 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = Format::Text, global = true)]
     format: Format,
+
+    /// Easier-to-read text output. The end-of-capture summary groups each
+    /// endpoint's attributes by kind (answers first, then flags, scores and
+    /// signatures); in inference mode each live update is the endpoint's
+    /// profile, one attribute per line, wrapped in braces. Text only.
+    #[arg(long, global = true)]
+    pretty: bool,
 
     /// Analyse both directions of a session instead of just the traffic
     /// incoming from its initiator. Overrides `both-directions` in the config
@@ -117,6 +126,14 @@ enum Format {
 
 fn main() -> pf_core::Result<()> {
     let cli = Cli::parse();
+    if cli.pretty && matches!(cli.format, Format::Json) {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--pretty is for text output; --format json is already indented",
+            )
+            .exit();
+    }
 
     // `--debug` is a shorthand for `RUST_LOG=debug`; either way logs go to
     // stderr so they never land in `--format json`'s stdout output.
@@ -187,7 +204,7 @@ fn main() -> pf_core::Result<()> {
     };
 
     tracing::info!(source = %source.describe(), mode = ?config.output, "starting");
-    run(source.as_mut(), registry, &config, cli.format, cli.timings)
+    run(source.as_mut(), registry, &config, cli.format, cli.pretty, cli.timings)
 }
 
 fn run(
@@ -195,6 +212,7 @@ fn run(
     registry: Registry,
     config: &PipelineConfig,
     format: Format,
+    pretty: bool,
     timings: bool,
 ) -> pf_core::Result<()> {
     // pf-dispatch is generic over "a thing that turns a session into
@@ -248,7 +266,11 @@ fn run(
             }
             for subject in changed_subjects {
                 if let Some(profile) = store.get(&subject) {
-                    println!("{}", render_line(&subject, profile));
+                    if pretty {
+                        println!("{}", render_pretty_block(&subject, profile));
+                    } else {
+                        println!("{}", render_line(&subject, profile));
+                    }
                 }
             }
         })
@@ -298,7 +320,7 @@ fn run(
             // Marks where the live per-update lines stop and the final table
             // starts. JSON stays bare so it can be piped.
             println!("\n=== end of capture: summary of {} endpoints ===", store.iter().count());
-            print!("{}", render_text(&store));
+            print!("{}", if pretty { render_pretty(&store) } else { render_text(&store) });
         }
         Format::Json => print!("{}", render_json(&store)),
     }
