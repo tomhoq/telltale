@@ -227,6 +227,19 @@ Key crates to use: `serde` + `serde_yaml` (manifests), `pcap` or `etherparse`
   - Combinations across fingerprints belong to fusion. JA4S is the
     honeypot's own reply, so JA4+JA4S combinations only carry their JA4
     half here.
+- `tcpcluster`: the thesis's own TCP method (thesis SPEC 9.4.8), an OS
+  classifier, in-process over the data files `export_telltale.py --anchors`
+  writes (`db/tcpcluster/`, sha256-checked against its `meta.json` on load).
+  Exact lookup of the SYN + handshake-reply tuple in a fingerprint set; on a
+  miss, a hand-written port of the contrastive encoder (GRU + MLP, no ONNX)
+  and a nearest-member search over named clusters, then anchors. Emits only
+  OS keys: `os` (family), `versions` (a set, never one version), and for an
+  unnamed tuple the thesis's closest-known-OS `hint`. Comparing its family
+  with `f0p`'s (the thesis's spoof check) is fusion's job. Pinned by the
+  export's 400 test vectors. It follows the direction policy: the client's
+  reply to the SYN-ACK is found on its own side (ACK/RST at ISN + 1); the
+  SYN-ACK, when in view, decides window scaling, else the manifest's
+  `assume-server-scales` does.
 - `automation`: a separate, rule-based method answering "is this automated?"
   rather than "what is it?" — flags (`kind: flag`), one key per rule, for
   fusion to weigh and Phase 6 to score individually. Kept out of `ja4h` so

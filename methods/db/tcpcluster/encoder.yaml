@@ -1,0 +1,20 @@
+# float32 little-endian tensors in encoder.bin; offset in floats. Linear: y = x W^T + b.
+# GRU (1 layer, batch_first): PyTorch gate order r, z, n; output = hidden state after the last real token.
+# Forward: GRU(opt_emb[opt_ids]) | cat_embs[i][cats[i]] | nums -> trunk (Linear ReLU Linear ReLU Linear) -> L2 normalise.
+floats: 34575
+tensors:
+  - {name: opt_emb.weight, shape: [12, 16], offset: 0}
+  - {name: gru.weight_ih_l0, shape: [96, 16], offset: 192}
+  - {name: gru.weight_hh_l0, shape: [96, 32], offset: 1728}
+  - {name: gru.bias_ih_l0, shape: [96], offset: 4800}
+  - {name: gru.bias_hh_l0, shape: [96], offset: 4896}
+  - {name: cat_embs.0.weight, shape: [16, 4], offset: 4992}
+  - {name: cat_embs.1.weight, shape: [5, 4], offset: 5056}
+  - {name: cat_embs.2.weight, shape: [4, 3], offset: 5076}
+  - {name: cat_embs.3.weight, shape: [5, 3], offset: 5088}
+  - {name: trunk.0.weight, shape: [128, 68], offset: 5103}
+  - {name: trunk.0.bias, shape: [128], offset: 13807}
+  - {name: trunk.2.weight, shape: [128, 128], offset: 13935}
+  - {name: trunk.2.bias, shape: [128], offset: 30319}
+  - {name: trunk.4.weight, shape: [32, 128], offset: 30447}
+  - {name: trunk.4.bias, shape: [32], offset: 34543}

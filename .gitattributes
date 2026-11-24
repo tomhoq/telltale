@@ -1,0 +1,3 @@
+# tcpcluster's files are checked against the sha256 in its meta.json on load:
+# keep their bytes exactly as exported (no CRLF conversion on checkout).
+methods/db/tcpcluster/** -text

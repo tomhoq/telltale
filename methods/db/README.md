@@ -15,6 +15,7 @@ directory) and `database.format`, and its adapter implements
 | `ja4h_fingerprint.csv` | `ja4db-csv` | `ja4h`    | ja4db export |
 | `ja4t_fingerprint.csv` | `ja4db-csv` | `ja4t`    | ja4db export |
 | `user-agents.yaml`     | `rules`     | `claimed` | Hand-written: HTTP libraries, named scanners, research crawlers |
+| `tcpcluster/`          | `telltale-anchors` | `tcpcluster` | `export_telltale.py --anchors` (thesis SPEC 9.4.8), copied unmodified: fingerprint set, encoder weights, cluster search table, anchors, test vectors. `meta.json` holds each file's sha256, checked on load |
 
 The ja4db exports are loaded as-is. Only rows naming an application, library,
 device or OS are kept (most rows are unlabelled sightings), and fingerprints

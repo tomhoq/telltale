@@ -23,6 +23,7 @@ pub fn builtin_adapters() -> HashMap<&'static str, AdapterFactory> {
         ("ja4h", adapters::ja4h::build as AdapterFactory),
         ("ja4t", adapters::ja4t::build as AdapterFactory),
         ("claimed", adapters::claimed::build as AdapterFactory),
+        ("tcpcluster", adapters::tcpcluster::build as AdapterFactory),
         ("fusion", adapters::fusion::build as AdapterFactory),
     ])
 }
@@ -294,6 +295,8 @@ mod tests {
                 TcpOptionKind::WindowScale,
             ],
             eol_padding: None,
+            options_truncated: false,
+            header: Default::default(),
         };
 
         let mut session = Session::open(segment(Stage::Connect, b"", Some(syn)));

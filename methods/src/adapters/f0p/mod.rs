@@ -656,6 +656,8 @@ mod tests {
                 TcpOptionKind::WindowScale,
             ],
             eol_padding: None,
+            options_truncated: false,
+            header: Default::default(),
         }
     }
 
@@ -676,6 +678,8 @@ mod tests {
             timestamp: true,
             option_order: vec![Mss, Nop, WindowScale, Nop, Nop, Timestamp, SackPermitted, Eol],
             eol_padding: Some(1),
+            options_truncated: false,
+            header: Default::default(),
         }
     }
 

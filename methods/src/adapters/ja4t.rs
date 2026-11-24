@@ -125,6 +125,8 @@ mod tests {
             timestamp: options.contains(&Timestamp),
             option_order: options,
             eol_padding: None,
+            options_truncated: false,
+            header: Default::default(),
         }
     }
 
