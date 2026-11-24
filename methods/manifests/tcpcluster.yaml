@@ -1,0 +1,50 @@
+name: tcpcluster
+description: >
+  OS classification from the thesis's TCP method (thesis SPEC 9.4.8): the
+  client's SYN and its reply to the SYN-ACK (A1+A2+B features), looked up in a
+  fingerprint set of every tuple seen in reference and labeled traffic, and on
+  a miss embedded by a contrastive encoder and matched to the nearest named
+  cluster (then anchor). Gives the OS family and version set (an era, never
+  one version); an unnamed tuple gets a closest-known-OS hint.
+
+# Starts at the SYN, but answers only once the client has replied to the
+# SYN-ACK (or the session ends without it).
+required-stage: connect
+
+invocation:
+  # Re-run as the handshake arrives: the reply to the SYN-ACK is a feature.
+  trigger: every-observation
+  priority: 70
+  budget-ms: 50
+
+database:
+  path: ../db/tcpcluster/meta.json
+  format: telltale-anchors
+
+output:
+  fields:
+    - name: os
+      description: OS family of the tuple's named cluster or anchor. Strong on a fingerprint hit, Weak from the encoder.
+    - name: versions
+      description: Version set of that cluster, e.g. windows/{10|8.1}. Never a single guessed version.
+    - name: hint
+      description: >
+        Closest known OS, only when nothing named the tuple: the family of the nearest named-cluster
+        member within hint-max-distance. Always Weak; a guess, not a classification of the tuple.
+    - name: hint-distance
+      kind: score
+      description: >
+        Embedding distance to that member, alongside every hint. For scale: cluster radius (epsilon) 0.055,
+        hint limit 0.2805. The limit was calibrated on real OS stacks only, so a crafted SYN (e.g. MSS-only,
+        TTL 255) can be hinted (thesis lessons E34).
+
+params:
+  # Embedding distance within which a hint is given: results/final/hint_thresholds.json
+  # of the thesis repo, "encoder A1+A2+B" (at most 1% of unseen-family CIC connections hinted).
+  hint-max-distance: 0.2805
+  # Reference-only names (evaluate.py REF_FAMILIES): never a hint.
+  hint-skip-families: [scanner]
+  # With only the client's side in view (the default direction policy), the
+  # server's SYN-ACK is unseen: take it to scale its window exactly when the
+  # client offered scaling. Under --both-directions the SYN-ACK is read instead.
+  assume-server-scales: true

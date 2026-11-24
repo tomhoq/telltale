@@ -19,7 +19,7 @@ pub use evidence::{Confidence, Evidence, FieldKind};
 pub use manifest::{DatabaseSpec, Invocation, MethodManifest, OutputSchema, Trigger};
 pub use method::{Context, Method, Outcome};
 pub use observation::{
-    Direction, Endpoint, Observation, TcpFeatures, TcpOptionKind, TcpQuirk, Transport,
+    Direction, Endpoint, Observation, TcpFeatures, TcpHeader, TcpOptionKind, TcpQuirk, Transport,
 };
 pub use profile::{attribute_key, Profile, ProfileStore, Verdict};
 pub use session::{Session, SessionKey, SessionState, Stage};

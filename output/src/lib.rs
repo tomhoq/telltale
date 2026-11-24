@@ -7,4 +7,4 @@ pub mod consumer;
 pub mod render;
 
 pub use consumer::{BatchConsumer, InferenceConsumer};
-pub use render::{render_json, render_line, render_text};
+pub use render::{render_json, render_line, render_pretty, render_pretty_block, render_text};

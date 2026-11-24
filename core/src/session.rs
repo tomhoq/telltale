@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::evidence::Evidence;
 use crate::observation::{Direction, Endpoint, Observation, Transport};
 
 /// How far a session has progressed.
@@ -74,10 +77,50 @@ pub struct Session {
     pub stage: Stage,
     /// Observations in arrival order.
     ///
+    /// Each behind an `Arc`: in inference mode a snapshot of the session goes
+    /// to a worker on every packet while the assembler keeps appending, so a
+    /// clone copies one pointer per observation instead of every payload,
+    /// option list and quirk set. Observations are never changed once pushed.
+    /// Read them through [`Session::observations`] or
+    /// [`Session::from_initiator`], which yield `&Observation`.
+    ///
     /// TODO: cap this. A scanner hammering one port should not be able to grow a
     /// session unboundedly — decide on a ring buffer or a byte budget before
     /// this runs against real traffic.
-    pub observations: Vec<Observation>,
+    pub observations: Vec<Arc<Observation>>,
+    /// Methods that are done with this session. Shared by every snapshot of
+    /// it (a clone shares it), so it outlives the snapshot a method finished
+    /// on. Bookkeeping for the registry, not session data: not serialized.
+    #[serde(skip)]
+    pub completed: Arc<CompletedMethods>,
+}
+
+/// The evidence of each method that returned
+/// [`Outcome::Complete`](crate::Outcome::Complete) on a session, by method
+/// name. `Complete` means "do not invoke me again", so the registry skips the
+/// method on later passes, yet still hands this evidence to the methods after
+/// it in a pass (fusion reads the others' evidence).
+#[derive(Debug, Default)]
+pub struct CompletedMethods(Mutex<HashMap<String, Arc<[Evidence]>>>);
+
+impl CompletedMethods {
+    /// What the method said when it completed, if it has.
+    pub fn get(&self, method: &str) -> Option<Arc<[Evidence]>> {
+        self.lock().get(method).cloned()
+    }
+
+    /// Keeps the first record: two snapshots of a session can run on two
+    /// workers at once and both complete the same method.
+    pub fn record(&self, method: &str, evidence: &[Evidence]) {
+        self.lock()
+            .entry(method.to_string())
+            .or_insert_with(|| evidence.into());
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Arc<[Evidence]>>> {
+        // A panic elsewhere while holding it leaves the map itself valid.
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl Session {
@@ -95,7 +138,8 @@ impl Session {
             last_seen_at: observation.at,
             state: SessionState::Active,
             stage,
-            observations: vec![observation],
+            observations: vec![Arc::new(observation)],
+            completed: Arc::default(),
         }
     }
 
@@ -104,7 +148,12 @@ impl Session {
         if let Some(hint) = observation.stage_hint {
             self.advance(hint);
         }
-        self.observations.push(observation);
+        self.observations.push(Arc::new(observation));
+    }
+
+    /// Every observation, both directions, in arrival order.
+    pub fn observations(&self) -> impl Iterator<Item = &Observation> {
+        self.observations.iter().map(|o| &**o)
     }
 
     /// Stages only move forward.
@@ -128,9 +177,7 @@ impl Session {
 
     /// Observations sent by the initiator — usually all a method cares about.
     pub fn from_initiator(&self) -> impl Iterator<Item = &Observation> {
-        self.observations
-            .iter()
-            .filter(|o| o.source == self.initiator)
+        self.observations().filter(|o| o.source == self.initiator)
     }
 
     pub fn is_idle_at(&self, now: SystemTime, timeout: Duration) -> bool {

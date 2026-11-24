@@ -15,7 +15,9 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::SystemTime;
 
-use pf_core::{Endpoint, Observation, Stage, TcpFeatures, TcpOptionKind, TcpQuirk, Transport};
+use pf_core::{
+    Endpoint, Observation, Stage, TcpFeatures, TcpHeader, TcpOptionKind, TcpQuirk, Transport,
+};
 use pnet::packet::ethernet::{EtherType, EtherTypes, EthernetPacket};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Flags, Ipv4Packet};
@@ -137,6 +139,7 @@ fn ipv4(packet: &[u8], at: SystemTime) -> Option<Observation> {
             ttl: ip.get_ttl(),
             option_len: (header_len - IPV4_MIN_HEADER_LEN) as u8,
             quirks,
+            id: Some(id),
         },
     )
 }
@@ -171,6 +174,7 @@ fn ipv6(packet: &[u8], at: SystemTime) -> Option<Observation> {
             ttl: ip.get_hop_limit(),
             option_len: 0,
             quirks,
+            id: None,
         },
     )
 }
@@ -180,6 +184,8 @@ struct IpLayer {
     ttl: u8,
     option_len: u8,
     quirks: BTreeSet<TcpQuirk>,
+    /// IPv4 identification; IPv6 has none.
+    id: Option<u16>,
 }
 
 fn transport(
@@ -285,6 +291,8 @@ fn tcp_features(tcp: &TcpPacket, ip: IpLayer) -> TcpFeatures {
     let mut timestamp = false;
     let mut option_order = Vec::new();
     let mut eol_padding = None;
+    let mut options_truncated = false;
+    let mut timestamps = None;
 
     // Walked by hand rather than with pnet's option iterator: a malformed
     // option is itself a quirk (`bad`), and so is non-zero padding after EOL
@@ -329,11 +337,13 @@ fn tcp_features(tcp: &TcpPacket, ip: IpLayer) -> TcpFeatures {
         // Every other option is kind, length (counting both), then data.
         let Some(&len) = raw.get(at + 1) else {
             quirks.insert(TcpQuirk::BadOptions);
+            options_truncated = true;
             break;
         };
         let len = len as usize;
         if len < 2 || at + len > raw.len() {
             quirks.insert(TcpQuirk::BadOptions);
+            options_truncated = true;
             break;
         }
         let data = &raw[at + 2..at + len];
@@ -364,6 +374,7 @@ fn tcp_features(tcp: &TcpPacket, ip: IpLayer) -> TcpFeatures {
                 if valid_len {
                     let own = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                     let peer = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                    timestamps = Some((own, peer));
                     if own == 0 {
                         quirks.insert(TcpQuirk::ZeroTimestamp);
                     }
@@ -389,6 +400,15 @@ fn tcp_features(tcp: &TcpPacket, ip: IpLayer) -> TcpFeatures {
         timestamp,
         option_order,
         eol_padding,
+        options_truncated,
+        header: TcpHeader {
+            flags,
+            reserved: tcp.get_reserved(),
+            seq: tcp.get_sequence(),
+            ack: tcp.get_acknowledgement(),
+            ip_id: ip.id,
+            timestamps,
+        },
     }
 }
 
@@ -400,9 +420,8 @@ fn tcp_features(tcp: &TcpPacket, ip: IpLayer) -> TcpFeatures {
 /// exists to catch would look like a completed conversation. Closing is the
 /// assembler's call, made from session lifecycle rather than from one packet.
 ///
-/// The flags are not preserved anywhere else: [`Observation`] has no field for
-/// them. A method that needs to distinguish a RST from a FIN will have to add
-/// one.
+/// The flags themselves are kept on [`TcpHeader`], for a method that needs to
+/// tell a RST from a FIN.
 fn tcp_stage(flags: u8) -> Option<Stage> {
     match (flags & TcpFlags::SYN != 0, flags & TcpFlags::ACK != 0) {
         (true, false) => Some(Stage::Connect),

@@ -48,8 +48,7 @@ impl<'a> Context<'a> {
         let both = self.both_directions;
         let initiator = self.session.initiator;
         self.session
-            .observations
-            .iter()
+            .observations()
             .filter(move |o| both || o.source == initiator)
     }
 

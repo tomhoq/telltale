@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive"] }
 
 crossbeam-channel = "0.5"
 pnet = "0.35"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_yaml = "0.9"
 thiserror = "2"
 tracing = "0.1"

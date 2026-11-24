@@ -32,3 +32,7 @@ params:
   # Database lookup compares a_b_c only. d hashes cookie values, which differ
   # per visitor (session IDs), so no recorded entry could match anyone else.
   match-sections: 3
+  # Never read more than this much of the client's stream for the request
+  # head; a large upload must not make the method expensive. Above common
+  # server header limits (8 KiB), so a real head with big cookies still fits.
+  max-bytes: 16384

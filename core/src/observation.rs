@@ -62,6 +62,49 @@ pub struct TcpFeatures {
     /// 4-byte boundary — p0f's `eol+N`. `None` when no EOL was sent.
     #[serde(default)]
     pub eol_padding: Option<u8>,
+    /// The option walk stopped at an option whose length was missing, below
+    /// 2 or ran off the header. Its kind is still the last of `option_order`
+    /// (p0f lists it before checking), but its bytes were never an option.
+    /// Narrower than [`TcpQuirk::BadOptions`], which a wrong-sized option
+    /// that was walked past also sets.
+    #[serde(default)]
+    pub options_truncated: bool,
+    /// Header values the quirks above summarise, for a method that needs the
+    /// values themselves (an encoder reading the IP ID change from SYN to
+    /// ACK, say).
+    #[serde(default)]
+    pub header: TcpHeader,
+}
+
+/// Raw TCP/IP header values, as received.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpHeader {
+    /// The TCP flags byte (CWR ECE URG ACK PSH RST SYN FIN).
+    pub flags: u8,
+    /// The 4 bits between the data offset and the flags: 3 reserved bits and
+    /// NS, NS lowest.
+    pub reserved: u8,
+    pub seq: u32,
+    pub ack: u32,
+    /// IPv4 identification. `None` on IPv6, which has no ID in its fixed
+    /// header.
+    pub ip_id: Option<u16>,
+    /// The timestamp option's own and echoed values, when it is well formed.
+    pub timestamps: Option<(u32, u32)>,
+}
+
+impl TcpHeader {
+    pub const FIN: u8 = 0x01;
+    pub const SYN: u8 = 0x02;
+    pub const RST: u8 = 0x04;
+    pub const ACK: u8 = 0x10;
+    pub const URG: u8 = 0x20;
+    pub const ECE: u8 = 0x40;
+    pub const CWR: u8 = 0x80;
+
+    pub fn has(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
 }
 
 impl TcpFeatures {

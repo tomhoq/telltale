@@ -1,0 +1,88 @@
+{
+ "created": "2026-11-18T10:23:12+00:00",
+ "feature_version": 3,
+ "features": "A1+A2+B",
+ "opt_vocab": [
+  "PAD",
+  "EMPTY",
+  "MSS",
+  "NOP",
+  "WS",
+  "SOK",
+  "TS",
+  "EOL",
+  "SACK",
+  "TFO",
+  "MPTCP",
+  "OTHER"
+ ],
+ "model": "models/v4_nomult",
+ "model_sha256": "f176cf421efecbd8df73feace7af9ba59275157f281516db3db763dd21021cf6",
+ "reference": [
+  "data/reference/mawi-2017/records/mawi_20170703.jsonl",
+  "data/train/mawi/records/mawi_day1_isn.jsonl",
+  "data/test/honeypot/records/hp-20260928-23.jsonl"
+ ],
+ "reference_sample": 300000,
+ "labeled": "data/test/merged/labeled.jsonl",
+ "tiers": [
+  "A",
+  "C"
+ ],
+ "seed": 0,
+ "epsilon": 0.05543824567687473,
+ "purity": 0.9,
+ "scale": 1.0,
+ "clusters": 258,
+ "named_clusters": 48,
+ "member_tuples": 37521,
+ "search_rows": 4908,
+ "fingerprints": 52078,
+ "pruning_check": {
+  "known": {
+   "tuples": 52078,
+   "named_by_full_search": 1135,
+   "pruned_float64_differs": 0,
+   "pruned_float32_differs": 0
+  },
+  "augmented": {
+   "tuples": 20000,
+   "named_by_full_search": 430,
+   "pruned_float64_differs": 0,
+   "pruned_float32_differs": 0,
+   "named_by_anchor": 46
+  }
+ },
+ "anchors": 92,
+ "anchors_enabled": true,
+ "files": {
+  "fingerprints.tsv": {
+   "bytes": 2964685,
+   "sha256": "7e6875e3f26f7c1a3d354b5d5886f960345be9c425b4fed733b349677738ac24"
+  },
+  "search.tsv": {
+   "bytes": 2080641,
+   "sha256": "c03621b63846b6c5e51ca1cd04d906233b32ba54e8cd3d139d48c1fa2f3e484d"
+  },
+  "anchors.tsv": {
+   "bytes": 41124,
+   "sha256": "30404ecb9bdfcd2b1506949ca9d1090611b05d9aa589d12204a106b0886e1418"
+  },
+  "clusters.tsv": {
+   "bytes": 1581,
+   "sha256": "6cdd2e5c17ba5765ac9f408a51a46682fb747c10116e62ce9fe1b6d0afc8861b"
+  },
+  "encoder.bin": {
+   "bytes": 138300,
+   "sha256": "ed84efe4580fad195688d3a1753ca38c1dcd9937d3961636f4cdcc54f04b3f89"
+  },
+  "encoder.yaml": {
+   "bytes": 1201,
+   "sha256": "10ac5b2b36c25861c32ca8666cf677da74deff9415680f4778b29cdad9beba45"
+  },
+  "test_vectors.jsonl": {
+   "bytes": 553501,
+   "sha256": "5a7c0467fd981d4f4f6721914187788b0244e231e61bd68a62825c31bef80c15"
+  }
+ }
+}
