@@ -70,7 +70,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only the OS answers are written, and a session is kept to its first
     // packets: the methods read the handshake and the first request, and a
     // long flow's every packet would otherwise sit in memory until it ends.
-    const KEYS: [&str; 4] = ["os", "versions", "hint", "stack"];
+    const KEYS: [&str; 10] = [
+        "os",
+        "versions",
+        "hint",
+        "stack",
+        "client",
+        "products",
+        "os-ambiguous",
+        "os-inconsistent",
+        "client-ambiguous",
+        "client-inconsistent",
+    ];
     const MAX_PACKETS: u32 = 64;
     let mut seen: std::collections::HashMap<SessionKey, u32> = Default::default();
 
