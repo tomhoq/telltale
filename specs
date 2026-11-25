@@ -290,6 +290,87 @@ Key crates to use: `serde` + `serde_yaml` (manifests), `pcap` or `etherparse`
   short-lived sessions from one source, minimal/rigid TCP option sets typical
   of stateless scanners like Zmap/Masscan, no follow-through past handshake),
   not as one more per-session method.
+- **Fusion design** (agreed and implemented 2026-11-24; `adapters/fusion.rs`,
+  `manifests/fusion.yaml`):
+  1. *Input.* The classification evidence of the methods before it in the
+     pass, grouped by key name: `os` and `versions` are the OS topic,
+     `client` the client topic. A convention every method follows (a method
+     naming an OS emits `os`, one naming a tool emits `client`), so manifests
+     need no extra field. Scores, flags and raw signatures are not claims and
+     are not merged.
+  2. *Normalise.* Two short tables in `fusion.yaml`, the only closed
+     vocabularies: OS `families` (linux, windows, macos, freebsd, ...) and
+     client `categories` (scanner, library, browser, crawler, malware,
+     device), each a keyword list; the first keyword found decides it.
+     Everything below that level stays free text, compared as lowercase
+     words (`debian12` is `debian 12`), so the long tail of client names never
+     needs a taxonomy. Below the family every word is compared, keywords
+     included (`android`, `ubuntu 22.04`, `ios`): only the entry's name and
+     its `family-synonyms` (`mac`, `osx`, `os x`, `iphone` for macos) are
+     dropped, so ja4t's `Mac OSX/iPhone` names no version. A label no keyword matches
+     is kept as `other:<label>`, never dropped. An `os` value naming a client
+     category (tcpcluster's `scanner`) counts as a client claim.
+  3. *Weigh.* Each claim scores `weight(method) x confidence` (strong 1.0,
+     likely 0.6, weak 0.3), weights in `fusion.yaml` (`method-weights`;
+     `weights` there is the scanner verdict's): the recent databases
+     (ja4db, tcpcluster) above p0f.fp (2012), the self-reported User-Agent
+     (`claimed`) lowest. A separate `version-weights` overrides below the
+     family: f0p 0, since p0f's version ranges were wrong on every modern
+     lab host (docs/findings/os-coverage-2026-11.md).
+  4. *Decide, level by level.* Family (or category) first, then the rest
+     within it: the top candidate is taken if it holds at least `accept`
+     (0.7) of the score; otherwise fusion stops at the level above and lists
+     the candidates. The fused answer is `Strong` when at least two methods
+     back it with `Strong` claims, `Likely` when its score is at least 1.0,
+     `Weak` otherwise.
+  5. *Disagreement, three outcomes.* Agreed: a majority as above.
+     Inconsistent: another family backed only by methods of a different
+     layer than the leading one (the TCP stack says one family, the HTTP
+     side another), each side with at least `min-support` (0.3) of
+     confidence, method weights ignored — so the self-reported User-Agent
+     (claimed's `os`, always Weak) is flagged, never believed — and flagged even when the leader
+     has a majority and is still the answer. Ambiguous: no majority, and not
+     inconsistent (the methods disagree about the same packets, or the
+     sides are too weak) — uncertainty, not suspicion. Inconsistent is a
+     suspicion signal, weighed into the verdict
+     (`os-client-mismatch`), never a verdict alone, since proxies, NAT,
+     VPNs, WSL and VMs produce it honestly. The layer comes from the
+     method's `required-stage`: `connect` is transport (f0p, ja4t,
+     tcpcluster), `tls-client-hello` and `app-data` are application (ja4,
+     ja4h, claimed). This stands in for §2's `layer`, which the manifests do
+     not carry yet.
+  6. *Cross-topic rule.* When the client category is `scanner`, every OS
+     claim is discounted before the OS is decided: the SYN is the tool's
+     crafted one (ZMap's SYN is p0f's "Linux barebone"; docs/findings) and
+     the User-Agent its choice. The `inconsistent` flag is decided before
+     the discount, so a scanner faking a browser's User-Agent is still
+     flagged.
+  7. *Output.* `os` and `versions`, `client` and `products` (candidates
+     joined `a | b` when undecided), and the flags `os-ambiguous`,
+     `os-inconsistent`, `client-ambiguous`, `client-inconsistent` naming the
+     sides and the methods behind each, appended like any method's results;
+     the other methods' results stay as they are. The scanner `verdict` is
+     not emitted until its scoring exists. Trigger `every-observation`
+     (changed 2026-11-25 from `session-end`): fusion re-merges on every pass,
+     `Partial` until the session ends, so a live run shows the answer as soon
+     as the other methods have claims. At `session-end` it showed only once a
+     connection closed or idled out, and never for sessions still open when
+     a live capture was stopped with Ctrl+C. Cost: 10-45 µs of worker CPU per
+     packet in inference mode; wall time unchanged on the honeypot and the
+     debian12 lab capture.
+  8. *Worked example.* ja4t `os` "WSL Ubuntu 22.04" (strong), tcpcluster
+     `os` linux and `versions` linux/debian12 (strong), f0p `os` "Linux
+     2.2.x-3.x" (likely). Family: linux scores 1.0 + 1.0 + 0.6 x 0.6 = 2.36,
+     all of it, two strong claims: `fusion.os linux Strong`. Within linux:
+     wsl ubuntu 22.04 1.0, debian 12 1.0, f0p 0 (version weight): 50 %,
+     below `accept`, so `versions "debian 12 | wsl ubuntu 22.04" Weak` — a SYN
+     cannot tell the two apart; each database names the one example it was
+     built from. The same endpoint with a Windows Chrome User-Agent: windows
+     scores 0.3 x 0.3 = 0.09 against 2.36, so the answer stays linux and,
+     that side being below `min-support`, nothing is flagged; a strong ja4h
+     `os: Windows 10` (1.0, application layer) would leave the answer linux
+     (70 %) and add `os-inconsistent`. On the 8 lab VMs fusion names the
+     right family on every connection, with no flags.
 
 ### Phase 6 — Evaluation harness
 - Batch-mode runner over unlabelled honeypot pcap data, computing %

@@ -1,24 +1,117 @@
 name: fusion
 description: >
-  Combines multi-layer evidence from other methods to consolidate intruder
-  characteristics (OS, client stack) and infer an overall classification or verdict.
-enabled: false
+  Merges the other methods' classifications into one answer per topic (the
+  endpoint's OS, its client) and flags where they disagree: ambiguous when no
+  answer has a majority, inconsistent when the TCP stack and the application
+  side name different families. Design: specs, Phase 5, "Fusion design".
+enabled: true
 
 # Runs on whatever exists, however little.
 required-stage: connect
 
 invocation:
   # Lowest priority so the evidence it combines is already in the context.
-  trigger: session-end
+  # Re-run as the session grows (Partial until it ends), so a live run shows
+  # the merged answer as soon as the other methods have claims, not only once
+  # the connection closes. Costs 10-45 us of worker CPU per packet.
+  trigger: every-observation
   priority: -100
   budget-ms: 100
 
 output:
   fields:
+    - name: os
+      description: OS family the methods agree on, or the candidates (a | b) when none has a majority.
+    - name: versions
+      description: Within that family, the version the methods agree on, or the candidates.
+    - name: client
+      description: Client category (scanner, library, browser, ...) the methods agree on, or the candidates.
+    - name: products
+      description: Within that category, the product the methods agree on (zmap, curl), or the candidates.
+    - name: os-ambiguous
+      kind: flag
+      description: No OS family has a majority; the two leading sides and the methods behind each.
+    - name: os-inconsistent
+      kind: flag
+      description: >
+        The transport layer (TCP stack) and the application layer name different OS families, each
+        with at least min-support. Spoofing, or something in between (proxy, NAT, VPN, WSL, a VM).
+    - name: client-ambiguous
+      kind: flag
+      description: No client category has a majority; the two leading sides.
+    - name: client-inconsistent
+      kind: flag
+      description: Transport and application layer name different client categories.
     - name: verdict
-      description: scanner | benign | unknown
+      description: scanner, once the verdict's scoring exists (not yet; never emitted until then).
 
 params:
+  # --- merging (specs, Phase 5, "Fusion design") ---
+
+  # How much each method's claim counts. A method not listed counts 1.0.
+  method-weights:
+    ja4t: 1.0         # ja4db: recent, community-maintained
+    ja4h: 1.0
+    ja4: 1.0
+    tcpcluster: 1.0   # recent, built from labelled traffic
+    f0p: 0.6          # p0f.fp dates from 2012
+    claimed: 0.3      # self-reported User-Agent: anyone can set it
+  # Below the family (versions, products). A method not listed uses its weight above.
+  version-weights:
+    f0p: 0.0          # its version ranges were wrong on every modern lab host (docs/findings)
+  confidence:
+    strong: 1.0
+    likely: 0.6
+    weak: 0.3
+  # Share of the score the leading answer needs to be taken.
+  accept: 0.7
+  # Support each side needs before a split between layers counts as
+  # inconsistent: the sum of its claims' confidence values, method weights
+  # ignored. The weights decide which answer to trust; they must not hide that
+  # the client claimed something its stack contradicts (claimed is always
+  # weak, 0.3). 0.3 = at least one claim on each side.
+  min-support: 0.3
+  # A client in this category means the connection is a tool's: every OS claim
+  # (its crafted SYN, the User-Agent it chose) is multiplied by
+  # scanner-discount (0 drops them) before the OS is decided. The
+  # inconsistent flag is decided before that, so a scanner's fake browser
+  # User-Agent is still flagged.
+  scanner-category: scanner
+  scanner-discount: 0.0
+
+  # The two closed vocabularies. The keyword appearing earliest in a label
+  # decides its family / category (ties: the one listed first). Below the
+  # family, every word of the label is compared, its keywords included
+  # (`ubuntu 22.04`, `android`, `ios`, `zmap`): only the entry's own name and,
+  # for a family, its family-synonyms are dropped.
+  families:
+    linux: [linux, ubuntu, debian, fedora, centos, red hat, aws linux, android, chrome os, wsl]
+    windows: [windows]
+    macos: [os x, macos, mac os, osx, mac, ios, iphone, ipad]
+    freebsd: [freebsd]
+    openbsd: [openbsd]
+    netbsd: [netbsd]
+    solaris: [solaris]
+    blackberry: [blackberry]
+    nintendo: [nintendo]
+    tru64: [tru64]
+    openvms: [openvms]
+  # Words that are only other names for a family (or, for macos, Apple
+  # devices rather than OS versions), dropped when comparing below it: ja4t's
+  # "Mac OSX/iPhone" names no version. Every other keyword is a version.
+  family-synonyms:
+    macos: [os x, mac os, osx, mac, iphone, ipad]
+  categories:
+    scanner: [scanner, zmap, masscan, nmap, zgrab, nuclei, nikto, sqlmap, wpscan, dirbuster, gobuster, burp suite, owasp zap, wappalyzer]
+    crawler: [crawler, shodan, censysinspect, censys, internetmeasurement, expanse, baiduspider]
+    malware: [malware, cobalt strike, icedid, darkgate, lumma, sliver]
+    library: [library, curl, wget, python requests, python urllib, python, go http client, golang, java, apache httpclient, axios, node fetch, okhttp, libwww perl]
+    browser: [browser, chrome, chromium, firefox, safari, edge, samsung internet, opera, msie]
+    application: [application, anydesk, telegram, softether, ngrok]
+    malformed: [malformed, no user agent, bare mozilla]
+
+  # --- scanner verdict (placeholder: its scoring is a TODO in fusion.rs) ---
+
   # Score at or above which the endpoint is called a scanner.
   threshold: 0.7
   # Per-signal weights. This block is the knob to sweep when tuning.
