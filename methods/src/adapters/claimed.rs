@@ -55,11 +55,53 @@ impl ClaimRule {
     }
 }
 
+/// One `os:` entry of `methods/db/user-agents.yaml`: the OS a User-Agent
+/// says it runs on. The first entry that matches wins, so the database lists
+/// the specific before the general (an iPhone's User-Agent also says "like
+/// Mac OS X", an Android one "Linux").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OsRule {
+    /// This substring appears in the User-Agent, case-insensitively.
+    pub contains: String,
+    /// The OS claimed, e.g. `Windows 10`.
+    pub os: String,
+    /// A version follows this substring (`iPhone OS 18_7` -> `18.7`), and
+    /// is appended to `os`.
+    #[serde(default)]
+    pub version_after: Option<String>,
+}
+
+impl OsRule {
+    fn claim(&self, ua_lower: &str) -> Option<String> {
+        if !ua_lower.contains(&self.contains.to_ascii_lowercase()) {
+            return None;
+        }
+        let version = self.version_after.as_ref().and_then(|anchor| {
+            let anchor = anchor.to_ascii_lowercase();
+            let at = ua_lower.find(&anchor)? + anchor.len();
+            let version: String = ua_lower[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '_' || *c == '.')
+                .map(|c| if c == '_' { '.' } else { c })
+                .collect();
+            let version = version.trim_end_matches('.').to_string();
+            (!version.is_empty()).then_some(version)
+        });
+        Some(match version {
+            Some(v) => format!("{} {v}", self.os),
+            None => self.os.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ClaimDb {
     #[serde(default)]
     pub rules: Vec<ClaimRule>,
+    #[serde(default)]
+    pub os: Vec<OsRule>,
 }
 
 impl Database for ClaimDb {
@@ -191,6 +233,11 @@ impl Method for Claimed {
             if let Some(version) = extract_version(&user_agent, &ua_lower, rule) {
                 evidence.push(Evidence::new(self.name(), subject, "version", version, Confidence::Weak));
             }
+        }
+        // The OS it says it runs on: self-reported like the rest, so Weak,
+        // and exactly what fusion checks against the TCP stack.
+        if let Some(os) = self.db.os.iter().find_map(|rule| rule.claim(&ua_lower)) {
+            evidence.push(Evidence::new(self.name(), subject, "os", os, Confidence::Weak));
         }
 
         // A User-Agent match is a settled claim, not one that refines with
@@ -330,5 +377,20 @@ mod tests {
         let outcome = run(&[(true, a), (true, b)], false);
         assert!(matches!(outcome, Outcome::Complete(_)), "{outcome:?}");
         assert!(keys(&outcome).contains(&"client"), "{outcome:?}");
+    }
+
+    /// The OS a User-Agent claims, mobile before desktop.
+    #[test]
+    fn the_user_agent_names_its_os() {
+        let db = db();
+        let os = |ua: &str| db.os.iter().find_map(|r| r.claim(&ua.to_ascii_lowercase()));
+        let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Mobile/15E148 Safari/604.1 Brave";
+        assert_eq!(os(iphone).as_deref(), Some("iOS 18.7"));
+        assert_eq!(os("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0").as_deref(), Some("Windows 10"));
+        assert_eq!(os("Mozilla/5.0 (Linux; Android 13; Pixel 7) Chrome/120.0").as_deref(), Some("Android 13"));
+        assert_eq!(os("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15").as_deref(), Some("Mac OS X 10.15.7"));
+        assert_eq!(os("Mozilla/5.0 (X11; Linux x86_64) Firefox/121.0").as_deref(), Some("Linux"));
+        assert_eq!(os("Mozilla/5.0 (compatible; Microsoft-WebDAV)"), None);
+        assert_eq!(os("curl/8.5.0"), None);
     }
 }
