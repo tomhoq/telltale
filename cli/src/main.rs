@@ -8,7 +8,7 @@ mod pick;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use pf_capture::sources::{HoneypotLogSource, LiveSource, PcapFileSource, TcpdumpSource};
@@ -243,7 +243,7 @@ fn run(
     let print_on_the_spot = config.output == OutputMode::InferenceTime && matches!(format, Format::Text);
     let consumer = thread::spawn(move || {
         if !print_on_the_spot {
-            return BatchConsumer::consume(results);
+            return BatchConsumer::consume_timed(results);
         }
         // `f0p`'s `every-observation` trigger re-confirms the same value on
         // every packet once it's found one (see learning-records/0002) —
@@ -253,7 +253,7 @@ fn run(
         // prints as one line, and only when it changes one of its keys for
         // that endpoint — per method, the same way the store keys it.
         let mut last_printed: HashMap<(Endpoint, String), String> = HashMap::new();
-        InferenceConsumer::consume_streaming(results, |update, store| {
+        InferenceConsumer::consume_streaming_timed(results, |update, store| {
             let mut changed_subjects: Vec<Endpoint> = Vec::new();
             for evidence in update {
                 let seen_key = (evidence.subject, attribute_key(&evidence.method, &evidence.key));
@@ -276,13 +276,25 @@ fn run(
         })
     });
 
+    // Time in each of the tool's own stages, for `--timings`. A few clock
+    // reads per packet: cheap enough to take always.
+    let started = Instant::now();
+    let mut stages = StageTimes::default();
     let mut packets: u64 = 0;
-    while let Some(observation) = source.next_observation()? {
+    loop {
+        let reading = Instant::now();
+        let next = source.next_observation()?;
+        stages.capture += reading.elapsed();
+        let Some(observation) = next else { break };
         packets += 1;
         let now = observation.at;
         log_observation(&observation);
 
-        match assembler.ingest(observation) {
+        let assembling = Instant::now();
+        let emitted = assembler.ingest(observation);
+        stages.assembly += assembling.elapsed();
+        let dispatching = Instant::now();
+        match emitted {
             Emitted::Opened(key) | Emitted::Updated(key) => {
                 // In streaming mode every new observation is a chance to refine
                 // the verdict; in batch mode we wait for the session to finish.
@@ -294,23 +306,38 @@ fn run(
             }
             Emitted::Finished(session) => submit(&dispatcher, session, true),
         }
+        stages.dispatch += dispatching.elapsed();
 
         // The timeout is what stops a method that is waiting on a stage from
         // pinning a session open forever.
-        for session in assembler.expire(now) {
+        let assembling = Instant::now();
+        let expired = assembler.expire(now);
+        stages.assembly += assembling.elapsed();
+        let dispatching = Instant::now();
+        for session in expired {
             submit(&dispatcher, session, true);
         }
+        stages.dispatch += dispatching.elapsed();
     }
 
-    for session in assembler.drain() {
+    let assembling = Instant::now();
+    let remaining = assembler.drain();
+    stages.assembly += assembling.elapsed();
+    let dispatching = Instant::now();
+    for session in remaining {
         submit(&dispatcher, session, true);
     }
+    stages.dispatch += dispatching.elapsed();
 
     // Closing the queue lets the workers finish and the result channel close,
     // which is what lets the consumer thread's `for batch in results` loop
     // end and hand back the final store.
+    let finishing = Instant::now();
     dispatcher.shutdown();
-    let store = consumer.join().expect("result consumer thread should not panic");
+    let (store, output) = consumer.join().expect("result consumer thread should not panic");
+    stages.finish = finishing.elapsed();
+    stages.output = output;
+    let summarising = Instant::now();
 
     match format {
         // In inference mode this follows the lines already printed as results
@@ -324,8 +351,9 @@ fn run(
         }
         Format::Json => print!("{}", render_json(&store)),
     }
+    stages.summary = summarising.elapsed();
     if timings {
-        let table = render_timings(&registry.timings(), packets);
+        let table = render_timings(&registry.timings(), &stages, packets, config.workers, started.elapsed());
         // Never inside JSON on stdout.
         match format {
             Format::Text => print!("{table}"),
@@ -335,43 +363,78 @@ fn run(
     Ok(())
 }
 
-/// Per method: how often it ran, its average time per run, and its total
-/// time spread over every packet read — the cost each packet carries for
-/// that method, whether or not it ran on that packet.
-fn render_timings(timings: &[MethodTiming], packets: u64) -> String {
+/// Time spent in each of the tool's own stages over a run, for `--timings`.
+#[derive(Default)]
+struct StageTimes {
+    /// Reading and decoding packets (`Source::next_observation`).
+    capture: Duration,
+    /// Assigning packets to sessions, and timeouts (`Assembler`).
+    assembly: Duration,
+    /// Handing sessions to the workers: in inference mode, a snapshot of the
+    /// session on every packet.
+    dispatch: Duration,
+    /// The result consumer recording evidence into the profile store, and in
+    /// inference mode rendering the live lines: its work, not its waiting.
+    output: Duration,
+    /// Rendering and printing the end-of-capture summary.
+    summary: Duration,
+    /// After the last packet: waiting for the workers and the consumer to
+    /// finish what is queued. Wall time, not work.
+    finish: Duration,
+}
+
+/// One table for the whole run, per packet read: the tool's own stages
+/// (main thread, result consumer) and each method (worker threads). Stages
+/// and methods are work; the threads run in parallel, so the work can add up
+/// to more than the wall time.
+fn render_timings(
+    timings: &[MethodTiming],
+    stages: &StageTimes,
+    packets: u64,
+    workers: usize,
+    wall: Duration,
+) -> String {
     let micros = |d: Duration| d.as_secs_f64() * 1e6;
+    let per_packet = |d: Duration| if packets == 0 { 0.0 } else { micros(d) / packets as f64 };
+    let row = |name: &str, thread: &str, runs: String, d: Duration, per_run: String| {
+        format!(
+            "{name:<16} {thread:<9} {runs:>9} {:>12.3} {per_run:>11} {:>12.3}\n",
+            d.as_secs_f64() * 1e3,
+            per_packet(d)
+        )
+    };
     let mut out = format!(
-        "
-=== method timings over {packets} packets ===
-{:<10} {:>9} {:>12} {:>14} {:>16}
-",
-        "method", "runs", "total ms", "avg/run µs", "avg/packet µs"
+        "\n=== timings over {packets} packets: wall {:.0} ms ({:.3} µs/packet), {workers} workers ===\n",
+        wall.as_secs_f64() * 1e3,
+        per_packet(wall)
     );
-    let mut total = Duration::ZERO;
-    for timing in timings {
-        total += timing.total;
-        let per_run = if timing.runs == 0 { 0.0 } else { micros(timing.total) / timing.runs as f64 };
-        let per_packet = if packets == 0 { 0.0 } else { micros(timing.total) / packets as f64 };
-        out.push_str(&format!(
-            "{:<10} {:>9} {:>12.3} {:>14.3} {:>16.3}
-",
-            timing.name,
-            timing.runs,
-            timing.total.as_secs_f64() * 1e3,
-            per_run,
-            per_packet
-        ));
-    }
-    let per_packet = if packets == 0 { 0.0 } else { micros(total) / packets as f64 };
     out.push_str(&format!(
-        "{:<10} {:>9} {:>12.3} {:>14} {:>16.3}
-",
-        "all",
-        "",
-        total.as_secs_f64() * 1e3,
-        "",
-        per_packet
+        "{:<16} {:<9} {:>9} {:>12} {:>11} {:>12}\n",
+        "stage", "thread", "runs", "total ms", "µs/run", "µs/packet"
     ));
+    let tool = [
+        ("capture", "main", stages.capture),
+        ("assembly", "main", stages.assembly),
+        ("dispatch", "main", stages.dispatch),
+        ("output", "consumer", stages.output),
+        ("summary", "main", stages.summary),
+    ];
+    let mut infrastructure = Duration::ZERO;
+    for (name, thread, d) in tool {
+        infrastructure += d;
+        out.push_str(&row(name, thread, String::new(), d, String::new()));
+    }
+    let mut methods = Duration::ZERO;
+    for timing in timings {
+        methods += timing.total;
+        let per_run = if timing.runs == 0 { 0.0 } else { micros(timing.total) / timing.runs as f64 };
+        out.push_str(&row(&timing.name, "worker", timing.runs.to_string(), timing.total, format!("{per_run:.3}")));
+    }
+    out.push_str(&row("= infrastructure", "", String::new(), infrastructure, String::new()));
+    out.push_str(&row("= methods", "", String::new(), methods, String::new()));
+    out.push_str(&row("= all work", "", String::new(), infrastructure + methods, String::new()));
+    out.push_str(&row("wait at end", "main", String::new(), stages.finish, String::new()));
+    out.push_str(&row("wall", "", String::new(), wall, String::new()));
     out
 }
 
