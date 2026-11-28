@@ -2,7 +2,10 @@
 
 How much each method costs per packet, how much Telltale itself costs, and
 what changed in the dispatch path to bring inference mode from ~1 ms per packet
-to tens of µs. The raw results and the script are in [`bench/`](bench/).
+to tens of µs. The raw results and the script are in [`bench/`](bench/):
+`baseline-9ff3720`, `step1-dde10d3`, `step3-61b4a3a`, and `first-request-a0149d6`
+(claimed and ja4h reading only the client's first request: claimed 90 -> 0.0 µs and ja4h
+73.5 -> 0.2 µs per packet on the honeypot, in inference mode).
 
 ## Where the time goes, per stage (2026-11-28)
 

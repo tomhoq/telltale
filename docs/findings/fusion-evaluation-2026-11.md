@@ -148,10 +148,12 @@ OS. The weighting is a safeguard. The scanner rule is where fusion changes many 
 
 ## Reproducing
 
-`D:\Documents\telltale-stats\eval-all\`:
-- `run.sh`: the os_stats runs.
+The scripts are in [`scripts/`](scripts/) (see its README):
+- `run-all-captures.sh`: the os_stats runs.
 - `compare.py`: the pooled and per-dataset tables, and the lie detector.
 - `per_version.py`: the appendix.
-- one TSV per capture.
+- `majority.py`: the majority-vote comparison.
 
-`D:\Documents\telltale-stats\fusion\majority.py`: the majority-vote comparison.
+The per-connection TSVs they read (one per capture, 50 MB to 5 GB) are not in git. They
+are in `D:\Documents\telltale-stats\eval-all\` (and `fusion\` for MAWI), and can be
+regenerated from the captures with the run script.
