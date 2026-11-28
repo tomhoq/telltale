@@ -2,7 +2,97 @@
 
 How much each method costs per packet, how much Telltale itself costs, and
 what changed in the dispatch path to bring inference mode from ~1 ms per packet
-to tens of µs. The raw results and the script are in [`bench/`](bench/).
+to tens of µs. The raw results and the script are in [`bench/`](bench/):
+`baseline-9ff3720`, `step1-dde10d3`, `step3-61b4a3a`, and `first-request-a0149d6`
+(claimed and ja4h reading only the client's first request: claimed 90 -> 0.0 µs and ja4h
+73.5 -> 0.2 µs per packet on the honeypot, in inference mode).
+
+## Where the time goes, per stage (2026-11-28)
+
+One run per dataset and output mode, `telltale-pf --timings --output <mode> replay -p
+<capture>`, text output, 12 workers, build `f9fdec1` plus the stage timers. Since that
+change, `--timings` times the tool's own stages as well as each method, in the same run:
+
+| stage | thread | what |
+|---|---|---|
+| capture | main | reading and decoding packets |
+| session assembly | main | assigning packets to sessions, timeouts |
+| dispatch | main | handing sessions to the workers (in inference mode: a snapshot on every packet) |
+| output | consumer | recording evidence into the profile store, and the live lines in inference mode |
+| end-of-capture summary | main | rendering and printing the summary |
+| each method | workers | time inside its `extract` |
+
+All values are µs per packet read. Stages and methods are CPU work. The main thread, the
+consumer and the 12 workers run at the same time, so the work adds up to more than the wall
+time.
+
+**Per-session mode** (each session analysed once, when it ends):
+
+| | honeypot | debian12 (lab) | macos15 (lab) | CIC Monday |
+|---|---|---|---|---|
+| packets | 28,772 | 330,048 | 1,113,093 | 4,989,228 |
+| capture (read + decode) | 0.9 | 0.4 | 1.1 | 0.4 |
+| session assembly | 0.6 | 1.5 | 0.7 | 4.1 |
+| dispatch | 0.1 | 0.1 | 0.1 | 0.2 |
+| output | 0.4 | 0.2 | 0.1 | 0.3 |
+| end-of-capture summary | 1.1 | 0.2 | 0.0 | 0.2 |
+| f0p | 0.5 | 0.2 | 0.1 | 0.4 |
+| ja4t | 0.1 | 0.1 | 0.0 | 0.1 |
+| ja4h | 0.2 | 0.0 | 0.0 | 0.6 |
+| claimed | 0.1 | 0.0 | 0.0 | 0.1 |
+| tcpcluster | 3.5 | 0.1 | 0.1 | 0.8 |
+| fusion | 0.8 | 0.6 | 0.2 | 0.9 |
+| **Telltale itself (sum)** | **3.2** | **2.3** | **2.0** | **5.2** |
+| **methods (sum)** | **5.3** | **1.1** | **0.5** | **3.0** |
+| **wall time** | **3.1** | **2.3** | **2.1** | **5.1** |
+
+**Inference mode** (every packet re-analyses its session, live output):
+
+| | honeypot | debian12 (lab) | macos15 (lab) |
+|---|---|---|---|
+| packets | 28,772 | 330,048 | 1,113,093 |
+| capture (read + decode) | 1.5 | 0.9 | 0.9 |
+| session assembly | 1.2 | 2.6 | 1.1 |
+| dispatch (snapshot) | 58.2 | 27.9 | 108.4 |
+| output (store + live lines) | 5.6 | 11.8 | 7.7 |
+| end-of-capture summary | 0.1 | 0.2 | 0.1 |
+| f0p | 18.3 | 56.7 | 50.2 |
+| ja4t | 15.5 | 0.3 | 17.3 |
+| ja4h | 0.2 | 0.0 | 0.1 |
+| claimed | 0.0 | 0.0 | 0.0 |
+| tcpcluster | 23.8 | 0.4 | 18.5 |
+| fusion | 10.3 | 41.6 | 24.6 |
+| **Telltale itself (sum)** | **66.6** | **43.4** | **118.2** |
+| **methods (sum)** | **68.2** | **99.0** | **110.7** |
+| **wall time** | **64.3** | **32.3** | **110.8** |
+
+What it shows:
+
+- **Per-session mode costs 2-5 µs per packet** in total. Telltale's own stages take about as
+  much as all the methods together.
+  - The largest method cost is tcpcluster on the honeypot, 3.5 µs, because most honeypot
+    tuples miss the fingerprint table and go through the encoder.
+  - Session assembly grows with the number of open sessions (CIC 4.1 µs).
+- **In inference mode the per-packet snapshot (dispatch) is the bottleneck:** 28-108 µs
+  per packet, and the wall time follows it.
+  - The methods' 68-111 µs of CPU run on the 12 workers alongside, so they cost little
+    wall time.
+  - Among the methods, f0p and fusion now cost most. f0p stays `Partial` until the session
+    ends, and fusion re-merges on every packet; the rest return `Complete` early.
+- **Two scaling limits, measured rather than estimated:**
+  - **Long sessions in inference mode:** CIC Monday had not finished after 27 min 47 s and
+    was stopped. The snapshot grows with session length.
+  - **Many open sessions in either mode:** the first 5M packets of MAWI 2026 had not
+    finished per-session after 20 min. `Assembler::expire` scans every open session on every
+    packet, and backbone scans keep tens of thousands open for the 30 s timeout. `os_stats`,
+    which expires every 4,096 packets, read the same capture in 2 min.
+- **Fixes, not implemented:**
+  - expire at most once per second of capture time (or keep sessions in a time-ordered
+    index), which makes assembly constant per packet;
+  - snapshots that cost the same at any session length;
+  - f0p returning `Complete` once it has nothing left to wait for.
+
+Raw tables and scripts: [`bench/stages-2026-11-28/`](bench/stages-2026-11-28/).
 
 ## The path being measured
 
@@ -30,8 +120,10 @@ disabled in their manifests.
 ## Setup
 
 - Intel Core i7-8700K (6 cores / 12 threads), 16 GB, Windows 10, rustc 1.96.0,
-  `--release`, `workers: 8`, 30 s session timeout, default direction policy
-  (initiator only).
+  `--release`, 12 workers, 30 s session timeout, default direction policy
+  (initiator only). 12 is the default without `--config`: one worker per
+  logical CPU (`config/pipeline.yaml`'s `workers: 8` applies only when that
+  file is passed). An earlier version of this doc said 8, which was wrong.
 - `bench/bench.py <exe> <empty-manifest-dir> <out.json> name=capture.pcap ...`
   runs each capture in both modes, with all methods and with none (an empty
   manifest directory, i.e. Telltale alone). Small captures take the fastest of
@@ -39,7 +131,7 @@ disabled in their manifests.
 - **Wall time per packet** = the whole run's wall-clock time / packets read.
 - **Method time per packet** = the time spent inside that method's `extract`
   (`--timings`) / every packet read, whether or not the method ran on it. This
-  is CPU time summed over the 8 workers, so method times do not add up to the
+  is CPU time summed over the 12 workers, so method times do not add up to the
   wall time.
 
 | capture | file (under `D:\Documents\new-method\data\test`) | packets | sessions |
@@ -181,7 +273,7 @@ The method, not the framework, knows when it is done. Honouring `Complete`
 
 - One machine. Large captures were run once, small ones best of 3; no variance
   is reported.
-- Method time is CPU time across 8 workers. Inference-mode wall time is bounded
+- Method time is CPU time across 12 workers. Inference-mode wall time is bounded
   by the main thread (snapshots), so method speed-ups show up in the method
   columns, not in the wall time.
 - The JSON profile is keyed by client IP:port, so two connections from the

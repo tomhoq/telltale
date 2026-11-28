@@ -17,8 +17,8 @@ database:
 
 output:
   fields:
-    - name: ja4
-      description: The raw ja4 hash.
+   # - name: ja4
+   #   description: The raw ja4 hash.
     - name: client
       description: Labelled client, when the hash is in the list.
     - name: known-scanner

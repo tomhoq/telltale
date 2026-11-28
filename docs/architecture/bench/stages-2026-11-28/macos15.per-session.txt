@@ -1,0 +1,18 @@
+=== timings over 1113093 packets: wall 2392 ms (2.149 µs/packet), 12 workers ===
+stage            thread         runs     total ms      µs/run    µs/packet
+capture          main                    1169.644                    1.051
+assembly         main                     809.684                    0.727
+dispatch         main                     106.800                    0.096
+output           consumer                  61.036                    0.055
+summary          main                      54.567                    0.049
+f0p              worker         9918      165.616      16.699        0.149
+ja4t             worker         9918       36.351       3.665        0.033
+ja4h             worker         9918       33.200       3.347        0.030
+claimed          worker         9918       15.998       1.613        0.014
+tcpcluster       worker         9918       92.080       9.284        0.083
+fusion           worker         9918      183.264      18.478        0.165
+= infrastructure                         2201.731                    1.978
+= methods                                 526.509                    0.473
+= all work                               2728.240                    2.451
+wait at end      main                       0.483                    0.000
+wall                                     2392.100                    2.149

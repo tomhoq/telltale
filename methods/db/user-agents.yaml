@@ -144,3 +144,27 @@ rules:
   - client: Shodan
     category: crawler
     contains: ["shodan"]
+
+# ---------------------------------------------------------------
+# The OS a User-Agent says it runs on, reported as claimed `os`. The first
+# entry whose `contains` matches wins, so mobile and specific entries come
+# before the desktop and generic ones: an iPhone's User-Agent also says
+# "like Mac OS X", an Android one "Linux". `version-after` appends the
+# number that follows (`iPhone OS 18_7` -> `iOS 18.7`).
+# ---------------------------------------------------------------
+os:
+  - {contains: "iphone os ", os: "iOS", version-after: "iphone os "}
+  - {contains: "cpu os ", os: "iOS", version-after: "cpu os "}        # iPad
+  - {contains: "android", os: "Android", version-after: "android "}
+  - {contains: "cros ", os: "Chrome OS"}
+  - {contains: "windows nt 10.0", os: "Windows 10"}                   # also Windows 11, which reports 10.0
+  - {contains: "windows nt 6.3", os: "Windows 8.1"}
+  - {contains: "windows nt 6.2", os: "Windows 8"}
+  - {contains: "windows nt 6.1", os: "Windows 7"}
+  - {contains: "windows nt 6.0", os: "Windows Vista"}
+  - {contains: "windows nt 5.1", os: "Windows XP"}
+  - {contains: "windows", os: "Windows"}
+  - {contains: "mac os x ", os: "Mac OS X", version-after: "mac os x "}
+  - {contains: "macintosh", os: "Mac OS X"}
+  - {contains: "freebsd", os: "FreeBSD"}
+  - {contains: "linux", os: "Linux"}

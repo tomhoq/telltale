@@ -253,7 +253,8 @@ mod tests {
 
     /// A SYN then a curl request: `f0p`, `ja4t`, `ja4h` and `claimed` all have something to
     /// say, and each says it in its own emit, in priority order, rather than
-    /// the two arriving together at the end of the pass.
+    /// the two arriving together at the end of the pass. `fusion`, last,
+    /// merges them already mid-session.
     #[test]
     fn each_method_reports_in_its_own_emit() {
         use std::net::{IpAddr, Ipv4Addr};
@@ -316,7 +317,7 @@ mod tests {
         });
 
         let methods: Vec<&str> = emits.iter().map(|emit| emit[0].as_str()).collect();
-        assert_eq!(methods, ["f0p", "ja4t", "ja4h", "claimed"]);
+        assert_eq!(methods, ["f0p", "ja4t", "ja4h", "claimed", "fusion"]);
         for emit in &emits {
             assert!(emit.iter().all(|m| m == &emit[0]), "one emit mixed methods: {emit:?}");
         }

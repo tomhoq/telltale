@@ -27,6 +27,10 @@ output:
       description: library | scanner | crawler | malformed (of the claimed client)
     - name: version
       description: Version the User-Agent claims, when the matched pattern has one to extract.
+    - name: os
+      description: >
+        OS the User-Agent says it runs on (Windows 10, iOS 18.7, Android 13), from the `os` list
+        in user-agents.yaml. A claim, always Weak: fusion checks it against the TCP stack.
 
 params:
   # Never scan more than this much payload; a large transfer must not make the

@@ -43,7 +43,7 @@ fn matches_the_exported_test_vectors() {
     let method = shipped();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("db/tcpcluster/test_vectors.jsonl");
     let text = std::fs::read_to_string(path).unwrap();
-    let (mut n, mut worst_emb, mut table_differs, mut hinted) = (0, 0f32, 0, 0);
+    let (mut n, mut worst_emb, mut table_differs) = (0, 0f32, 0);
     for (i, line) in text.lines().enumerate() {
         let v: Vector = serde_json::from_str(line).unwrap_or_else(|e| panic!("vector {i}: {e}"));
         n += 1;
